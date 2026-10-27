@@ -2955,9 +2955,9 @@ static const char *const kDnlPassDebugItems[] = { "Off", "What the model sees", 
 enum
 {
     DNL_FOVEA_FIRST = 6, DNL_FOVEA_DEBUG = 6,
-    DNL_PERI_FIRST = 12, DNL_PERI_LAST = 17,
-    DNL_FOV_FIRST = 18, DNL_FOVEATION = 18, DNL_SPLIT = 23, DNL_SPLIT_CALLS = 24, DNL_GLOBAL_SCALE = 25,
-    DNL_GAZE_SOURCE = 26, DNL_COUNT = 29
+    DNL_PERI_FIRST = 12, DNL_PERI_LAST = 18,
+    DNL_FOV_FIRST = 19, DNL_FOVEATION = 19, DNL_SPLIT = 24, DNL_SPLIT_CALLS = 25, DNL_GLOBAL_SCALE = 26,
+    DNL_GAZE_SOURCE = 27, DNL_COUNT = 30
 };
 
 static const NRSetting kDnl[DNL_COUNT] = {
@@ -2981,6 +2981,8 @@ static const NRSetting kDnl[DNL_COUNT] = {
       "The network: 0 = runtime default (Small FP8), 1 = Legacy." },
     { "Style",              "Style##fovea",            NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kDnlStyleItems, 3, nullptr },
 
+    { "PeripheryPass",      "Run the periphery pass",  NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
+      "Off skips this model call: outside the crop you see the game's own frame, lit by whatever shaders run before the feed (e.g. Glamarye's AO and fake GI)." },
     { "PeripheryDebugView", "Debug view##periphery",   NR_COMBO,  0.0f,  0.0f,  3.0f, nullptr, kDnlPassDebugItems, 4,
       "This pass alone, as the model saw and answered it, stretched over the screen." },
     { "SplitGlobalIntensity", "NR intensity##periphery", NR_FLOAT, 1.0f, 0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
