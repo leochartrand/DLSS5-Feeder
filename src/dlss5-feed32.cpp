@@ -2943,7 +2943,8 @@ static const NRSetting kNR[NR_COUNT] = {
 // addon-dlssnr-linux's settings, edited here and applied live by the add-on (see
 // DetectDlssnrLinuxHost). Same keys as its own [ADDON_DLSSNR_LINUX] section in the host's
 // ReShade.ini, which is where the first values come from when the live file does not exist yet.
-static const char *const kDnlDebugItems[] = { "Off", "What the model sees", "Model answer", "Difference x20" };
+static const char *const kDnlDebugItems[] = { "Off", "What the model sees", "Model answer", "Difference x20",
+                                             "Fovea map (foveated NR)" };
 static const char *const kDnlStyleItems[] = { "Default (standard)", "Natural", "Cinematic" };
 static const char *const kDnlGazeItems[]  = { "Fixed (frame centre)", "Gaze over UDP" };
 
@@ -2951,7 +2952,8 @@ enum { DNL_MODEL_FIRST = 6, DNL_FOV_FIRST = 11, DNL_COUNT = 19 };
 
 static const NRSetting kDnl[DNL_COUNT] = {
     { "Enabled",            "Enable Neural Rendering", NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0, nullptr },
-    { "DebugView",          "Debug view",              NR_COMBO,  0.0f,  0.0f,  3.0f, nullptr, kDnlDebugItems, 4, nullptr },
+    { "DebugView",          "Debug view",              NR_COMBO,  0.0f,  0.0f,  4.0f, nullptr, kDnlDebugItems, 5,
+      "Fovea map tints the frame by the resolution the model saw there and marks the fovea centre (cross) and the gaze point (ring)." },
     { "DetailStrength",     "Detail strength",         NR_FLOAT,  1.0f,  0.0f,  1.5f, "%.2f", nullptr, 0,
       "How far the frame moves toward the model's answer; 0 = bypass." },
     { "ColourStrength",     "Colour strength",         NR_FLOAT,  0.0f,  0.0f,  1.0f, "%.2f", nullptr, 0,
