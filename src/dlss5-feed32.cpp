@@ -3767,9 +3767,11 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         {
             char name[128];
             sprintf_s(name, FEED_DONE_MAP_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
-            g.done_map = OpenFileMappingA(FILE_MAP_READ, FALSE, name);
+            // Read-write although we only read: on x86 the atomic 64-bit read is a locked
+            // cmpxchg8b, which writes even when nothing changes, and faults on a read-only view.
+            g.done_map = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
             if (g.done_map != nullptr)
-                g.done = static_cast<FeedDoneBlock *>(MapViewOfFile(g.done_map, FILE_MAP_READ, 0, 0, sizeof(FeedDoneBlock)));
+                g.done = static_cast<FeedDoneBlock *>(MapViewOfFile(g.done_map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(FeedDoneBlock)));
             sprintf_s(name, FEED_DONE_EVT_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
             g.done_evt = OpenEventA(SYNCHRONIZE, FALSE, name);
             if (g.done == nullptr || g.done_evt == nullptr)
