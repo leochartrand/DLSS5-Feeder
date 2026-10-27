@@ -2332,6 +2332,23 @@ static void DetectChickenHost()
 #endif
 }
 
+// addon-dlssnr-linux in host64\ -- a ReShade add-on that runs DLSS 5 NR under Linux/Proton by
+// driving nvngx_dlssnr.dll directly. Its panel lives in the host's ReShade, which nobody sees, but
+// it applies host64\dlssnr-linux-live.ini while running -- so this page edits that file and the
+// change lands within half a second, with no host restart.
+static bool g_dlssnrlinux_host = false;
+
+static void DetectDlssnrLinuxHost()
+{
+    char p[MAX_PATH];
+    GetModuleFileNameA(g_self, p, MAX_PATH);
+    if (char *s = strrchr(p, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - p), "host64\\dlssnr-linux.addon64");
+    g_dlssnrlinux_host = GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES;
+    if (g_dlssnrlinux_host)
+        Log("[feed32] addon-dlssnr-linux: present in host64\\ -- its settings are on this page and apply live "
+            "through host64\\dlssnr-linux-live.ini");
+}
+
 // OptiScaler DLSS-NR in host64\ -- the third neural consumer on the split path (see feed_opti.h).
 // It is a 64-bit proxy DLL the HOST imports (winmm.dll or version.dll), so it lives in host64\
 // like Chicken does, and the host does the detecting and the two fingerprints. This side only
@@ -2922,6 +2939,76 @@ static const NRSetting kNR[NR_COUNT] = {
     { "NRMVecScaleY",      "Motion Scale Y Multiplier",    NR_FLOAT,  1.0f,  0.0f,  4.0f, "%.2f", nullptr, 0,
       "Applied by the add-on on top of the feed's own 'MV scale Y' above -- they multiply." },
 };
+
+// addon-dlssnr-linux's settings, edited here and applied live by the add-on (see
+// DetectDlssnrLinuxHost). Same keys as its own [ADDON_DLSSNR_LINUX] section in the host's
+// ReShade.ini, which is where the first values come from when the live file does not exist yet.
+static const char *const kDnlDebugItems[] = { "Off", "What the model sees", "Model answer", "Difference x20" };
+static const char *const kDnlStyleItems[] = { "Default (standard)", "Natural", "Cinematic" };
+static const char *const kDnlGazeItems[]  = { "Fixed (frame centre)", "Gaze over UDP" };
+
+enum { DNL_MODEL_FIRST = 6, DNL_FOV_FIRST = 11, DNL_COUNT = 19 };
+
+static const NRSetting kDnl[DNL_COUNT] = {
+    { "Enabled",            "Enable Neural Rendering", NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0, nullptr },
+    { "DebugView",          "Debug view",              NR_COMBO,  0.0f,  0.0f,  3.0f, nullptr, kDnlDebugItems, 4, nullptr },
+    { "DetailStrength",     "Detail strength",         NR_FLOAT,  1.0f,  0.0f,  1.5f, "%.2f", nullptr, 0,
+      "How far the frame moves toward the model's answer; 0 = bypass." },
+    { "ColourStrength",     "Colour strength",         NR_FLOAT,  0.0f,  0.0f,  1.0f, "%.2f", nullptr, 0,
+      "0 keeps the game's own hue and only brightness changes; 1 lets the model's colours through." },
+    { "HighlightGuard",     "Highlight guard",         NR_FLOAT,  2.0f,  1.0f,  8.0f, "%.1fx", nullptr, 0,
+      "How far the model may move any pixel's luminance, either way." },
+    { "WhitePointScale",    "White point scale",       NR_FLOAT,  1.0f,  0.1f,  4.0f, "%.2f", nullptr, 0, nullptr },
+
+    { "Intensity",          "NR intensity",            NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "StructureIntensity", "Structure intensity",     NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "GlobalIntensity",    "Global intensity",        NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "Preset",             "Preset",                  NR_FLOAT,  0.0f,  0.0f,  7.0f, "%.0f", nullptr, 0, nullptr },
+    { "Style",              "Style",                   NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kDnlStyleItems, 3, nullptr },
+
+    { "Foveation",          "Foveated NR",             NR_BOOL,   0.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
+      "Runs the model on a squeezed frame: full resolution inside the fovea, lower beyond it." },
+    { "FoveaWidth",         "Fovea width",             NR_FLOAT, 0.40f, 0.05f,  1.0f, "%.2f of the frame", nullptr, 0, nullptr },
+    { "FoveaHeight",        "Fovea height",            NR_FLOAT, 0.50f, 0.05f,  1.0f, "%.2f of the frame", nullptr, 0, nullptr },
+    { "FoveaFalloff",       "Falloff",                 NR_FLOAT, 0.10f,  0.0f,  0.5f, "%.2f of the height", nullptr, 0, nullptr },
+    { "FoveaEdge",          "Edge resolution",         NR_FLOAT, 0.50f, 0.25f,  1.0f, "%.2f", nullptr, 0, nullptr },
+    { "GazeSource",         "Fovea centre",            NR_COMBO,  0.0f,  0.0f,  1.0f, nullptr, kDnlGazeItems, 2, nullptr },
+    { "GazePort",           "Gaze UDP port",           NR_FLOAT, 47620.0f, 1024.0f, 65535.0f, "%.0f", nullptr, 0,
+      "Two little-endian float32 (x, y), 0..1 from the top-left, sent to 127.0.0.1 on this port." },
+    { "GazeSmoothMs",       "Gaze smoothing",          NR_FLOAT, 30.0f,  0.0f, 200.0f, "%.0f ms", nullptr, 0, nullptr },
+};
+
+static float g_dnl[DNL_COUNT];
+static bool  g_dnl_loaded;
+
+static void DnlPath(char *out, const char *file)
+{
+    GetModuleFileNameA(g_self, out, MAX_PATH);
+    if (char *s = strrchr(out, '\\')) sprintf_s(s + 1, MAX_PATH - (s + 1 - out), "host64\\%s", file);
+}
+
+static void ReadDnl()
+{
+    char live[MAX_PATH], host[MAX_PATH], buf[64];
+    DnlPath(live, "dlssnr-linux-live.ini");
+    DnlPath(host, "ReShade.ini");
+    for (int i = 0; i < DNL_COUNT; ++i)
+    {
+        GetPrivateProfileStringA("DLSSNR", kDnl[i].key, "", buf, sizeof(buf), live);
+        if (buf[0] == 0) GetPrivateProfileStringA("ADDON_DLSSNR_LINUX", kDnl[i].key, "", buf, sizeof(buf), host);
+        g_dnl[i] = buf[0] != 0 ? static_cast<float>(atof(buf)) : kDnl[i].def;
+    }
+}
+
+static void WriteDnl(int i)
+{
+    char live[MAX_PATH], buf[64];
+    DnlPath(live, "dlssnr-linux-live.ini");
+    const bool whole = kDnl[i].kind != NR_FLOAT || (kDnl[i].format != nullptr && strncmp(kDnl[i].format, "%.0f", 4) == 0);
+    if (whole) sprintf_s(buf, "%d", static_cast<int>(g_dnl[i] + 0.5f));
+    else       sprintf_s(buf, "%g", g_dnl[i]);
+    WritePrivateProfileStringA("DLSSNR", kDnl[i].key, buf, live);
+}
 
 static void HostIniPath(char *out)
 {
@@ -6171,6 +6258,49 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                "its menu (Insert), or set Enabled=true in host64\\OptiScaler.ini and restart the game.",
                                g_opti_enabled);
     }
+    else if (g_dlssnrlinux_host)
+    {
+        ImGui::Separator();
+        ImGui::TextUnformatted("DLSSNR Linux settings (on the host, applied live)");
+        ImGui::SameLine();
+        HelpMarker("addon-dlssnr-linux's own controls, written to host64\\dlssnr-linux-live.ini, which the "
+                   "add-on applies within half a second -- no host restart. Model settings rebuild the "
+                   "neural feature, which takes a moment; foveation geometry rebuilds it too.");
+        if (!g_dnl_loaded) { ReadDnl(); g_dnl_loaded = true; }
+        for (int i = 0; i < DNL_COUNT; ++i)
+        {
+            if (i == DNL_MODEL_FIRST)
+            {
+                ImGui::Spacing();
+                ImGui::TextDisabled("Model settings (rebuild the neural feature)");
+            }
+            else if (i == DNL_FOV_FIRST)
+            {
+                ImGui::Spacing();
+                ImGui::TextDisabled("Foveation");
+            }
+            // The gaze port and smoothing only mean something with a gaze source.
+            if ((i == DNL_COUNT - 2 || i == DNL_COUNT - 1) && g_dnl[DNL_COUNT - 3] < 0.5f) continue;
+
+            const NRSetting &s = kDnl[i];
+            bool edited = false;
+            if (s.kind == NR_BOOL)
+            {
+                bool b = g_dnl[i] != 0.0f;
+                if (ImGui::Checkbox(s.label, &b)) { g_dnl[i] = b ? 1.0f : 0.0f; edited = true; }
+            }
+            else if (s.kind == NR_COMBO)
+            {
+                int idx = static_cast<int>(g_dnl[i]);
+                if (idx < 0 || idx >= s.item_count) idx = 0;
+                if (ImGui::Combo(s.label, &idx, s.items, s.item_count)) { g_dnl[i] = static_cast<float>(idx); edited = true; }
+            }
+            else if (ImGui::SliderFloat(s.label, &g_dnl[i], s.lo, s.hi, s.format)) edited = true;
+            if (edited) WriteDnl(i);
+            if (s.tooltip != nullptr) { ImGui::SameLine(); HelpMarker(s.tooltip); }
+        }
+        if (ImGui::Button("Reload from host")) ReadDnl();
+    }
     else if (g_chicken_host)
     {
         // Chicken does not read [RenoDX.DLSS5]; mirroring that panel here would be a lie.
@@ -6472,6 +6602,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
                 "Enabled checkbox can undo this; nothing else runs.");
         DetectChickenHost();
         DetectOptiHost();       // after DetectChickenHost: it warns when both are in host64
+        DetectDlssnrLinuxHost();
         DetectStrayHostAddon();
 #ifdef FEED_HELPER64
         {
