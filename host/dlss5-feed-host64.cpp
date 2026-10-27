@@ -3135,6 +3135,81 @@ static bool ReadFull(HANDLE pipe, void *buf, DWORD len) { return TransferFull(pi
 static bool WriteFull(HANDLE pipe, const void *buf, DWORD len)
 { return TransferFull(pipe, const_cast<void *>(buf), len, true); }
 
+// FEED_BUILD_NO_FENCES (Wine, #121): the client cannot open fence_out, so a thread mirrors its
+// completed value into a named block the client can read. Watching the fence itself rather than
+// the evaluate path covers every way it moves -- the GPU signal after an evaluate, the CPU
+// signals on the failure paths, and the UINT64_MAX release at session end -- with no change to
+// the frame loop.
+static HANDLE         g_done_map    = nullptr;
+static HANDLE         g_done_evt    = nullptr;
+static FeedDoneBlock *g_done        = nullptr;
+static HANDLE         g_done_thread = nullptr;
+static volatile LONG  g_done_stop   = 0;
+static bool           g_no_fences   = false;
+
+static DWORD WINAPI DoneMirror(void *)
+{
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    UINT64 last = 0;
+    for (;;)
+    {
+        const UINT64 v = h.fence_out->GetCompletedValue();
+        if (v != last)
+        {
+            InterlockedExchange64(&g_done->completed, static_cast<LONG64>(v));
+            SetEvent(g_done_evt);
+            last = v;
+        }
+        // UINT64_MAX is the session-end release (or a removed device): nothing follows it.
+        if (v == UINT64_MAX || g_done_stop) break;
+        if (ev == nullptr || FAILED(h.fence_out->SetEventOnCompletion(v + 1, ev))) Sleep(1);
+        else WaitForSingleObject(ev, 100);   // the timeout only bounds how late a stop is seen
+    }
+    if (ev != nullptr) CloseHandle(ev);
+    return 0;
+}
+
+static bool DoneMirrorStart(DWORD game_pid)
+{
+    if (g_done_thread != nullptr) return true;
+    char name[128];
+    sprintf_s(name, FEED_DONE_MAP_FMT, static_cast<unsigned long>(game_pid));
+    g_done_map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(FeedDoneBlock), name);
+    if (g_done_map != nullptr)
+        g_done = static_cast<FeedDoneBlock *>(MapViewOfFile(g_done_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(FeedDoneBlock)));
+    sprintf_s(name, FEED_DONE_EVT_FMT, static_cast<unsigned long>(game_pid));
+    g_done_evt = CreateEventA(nullptr, FALSE, FALSE, name);
+    if (g_done == nullptr || g_done_evt == nullptr)
+    {
+        Log("[host] no-fence mode: the shared done block could not be created (error %lu)", GetLastError());
+        return false;
+    }
+    // A respawned host can find the block a previous session left at UINT64_MAX.
+    InterlockedExchange64(&g_done->completed, static_cast<LONG64>(h.fence_out->GetCompletedValue()));
+    g_done_stop   = 0;
+    g_done_thread = CreateThread(nullptr, 0, DoneMirror, nullptr, 0, nullptr);
+    if (g_done_thread == nullptr) { Log("[host] no-fence mode: mirror thread failed (error %lu)", GetLastError()); return false; }
+    Log("[host] no-fence mode (Wine, #121): fence_in is CPU-signalled per frame message, fence_out is mirrored to %s",
+        name);
+    return true;
+}
+
+static void DoneMirrorStop()
+{
+    if (g_done_thread != nullptr)
+    {
+        g_done_stop = 1;
+        if (WaitForSingleObject(g_done_thread, 2000) != WAIT_OBJECT_0) Log("[host] no-fence mirror did not stop");
+        CloseHandle(g_done_thread);
+        g_done_thread = nullptr;
+    }
+    // Whatever the fence did, nothing the client waits on may stay unreached.
+    if (g_done != nullptr) { InterlockedExchange64(&g_done->completed, -1); if (g_done_evt) SetEvent(g_done_evt); }
+    if (g_done != nullptr) { UnmapViewOfFile(g_done); g_done = nullptr; }
+    if (g_done_map != nullptr) { CloseHandle(g_done_map); g_done_map = nullptr; }
+    if (g_done_evt != nullptr) { CloseHandle(g_done_evt); g_done_evt = nullptr; }
+}
+
 static int Serve(DWORD game_pid)
 {
     char name[128];
@@ -3357,6 +3432,8 @@ static int Serve(DWORD game_pid)
             // present the per-evaluate call could not make becomes a debt or a drop (#15).
             const bool was_async = h.async_home;
             h.async_home = (b.client_flags & FEED_BUILD_ASYNC_HOME) != 0;
+            if ((b.client_flags & FEED_BUILD_NO_FENCES) != 0 && !g_no_fences)
+                g_no_fences = DoneMirrorStart(game_pid);
             static bool said_handoff = false;
             if (h.async_home != was_async || !said_handoff)
             {
@@ -3696,6 +3773,9 @@ static int Serve(DWORD game_pid)
             // (issue #15). A game whose GPU never reaches fm.n now surfaces three frames
             // later as BeginCommands' allocator-retire timeout, which fails the evaluate
             // and CPU-signals fence_out below -- the never-hang guarantee is unchanged.
+            // No-fence client: it drained its own device before sending fm, so its copies
+            // have landed and the permission is ours to give.
+            if (g_no_fences) h.fence_in->Signal(fm.n);
             h.queue->Wait(h.fence_in, fm.n);
 
             bool done = false;
@@ -3875,6 +3955,7 @@ static int Serve(DWORD game_pid)
     CloseHandle(ev_tag);
     if (!g_device_removed) WaitFenceValue(h.fence, h.fence_value, 2000);   // nothing to wait for on a dead device
     if (h.fence_out != nullptr) h.fence_out->Signal(UINT64_MAX);
+    DoneMirrorStop();
     Log("[host] pending game fence waits released; exiting%s", g_device_removed ? " (device removed)" : "");
     return g_device_removed ? 3 : 0;
 }

@@ -765,6 +765,13 @@ struct Feed32
     ID3D11Fence     *fence_out;   // host signals     (D3D11 client)
     HANDLE           fence_in_handle, fence_out_handle;   // GL client: kept for the GL import
     bool             fence_wait_queued;  // a GPU-side Wait(fence_out, frame_n) is outstanding
+    // D3D11 client under Wine (FEED_BUILD_NO_FENCES, #121): the fences are never imported.
+    // Signal(fence_in) becomes a drain of our own device, Wait(fence_out) a CPU wait on the
+    // value the host mirrors into a named block.
+    bool             no_fences;
+    HANDLE           done_map, done_evt;
+    FeedDoneBlock   *done;
+    ID3D11Query     *drain_q;
     ID3D11DeviceContext4 *ctx4;
     ID3D11Device    *dev;         // not owned
     ID3D11Multithread *mt;        // immediate-context serialization, restored on teardown
@@ -1083,6 +1090,8 @@ static void HostDrain()
                 static_cast<unsigned long long>(g.wait_n));
         return;
     }
+    // No-fence client: every wait was a CPU wait that already returned; nothing is queued.
+    if (g.no_fences) { g.fence_wait_queued = false; return; }
     if (g.fence_out == nullptr) return;
     g.fence_wait_queued = false;
     if (g.fence_out->GetCompletedValue() >= g.wait_n) return;
@@ -1146,6 +1155,13 @@ static void HostClose()
     // reopen from the new host's BuildAck instead of waiting on dead fences forever.
     SafeRelease(g.fence_in);
     SafeRelease(g.fence_out);
+    // Same for the no-fence block: a new host resets it, and holding the old view open
+    // would hand the new session its predecessor's UINT64_MAX.
+    if (g.done != nullptr) { UnmapViewOfFile(g.done); g.done = nullptr; }
+    if (g.done_map != nullptr) { CloseHandle(g.done_map); g.done_map = nullptr; }
+    if (g.done_evt != nullptr) { CloseHandle(g.done_evt); g.done_evt = nullptr; }
+    SafeRelease(g.drain_q);
+    g.no_fences = false;
     if (g.gl.ok && g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
     {
         if (g.gl_sem_in  != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_in);  g.gl_sem_in  = 0; }
@@ -1214,6 +1230,51 @@ static void HostLost(const char *why)
 static bool HostAlive()
 {
     return g.hproc != nullptr && WaitForSingleObject(g.hproc, 0) == WAIT_TIMEOUT;
+}
+
+// D3D11 client, fence_in: "our copies of frame n have landed". With no fence (Wine, #121)
+// that has to be true before the frame message goes out, so drain the device -- the same
+// event-query sync the D3D10 relay uses, and it covers the blit home recorded before it too.
+static void FenceSignalIn(UINT64 n)
+{
+    if (!g.no_fences) { g.ctx4->Signal(g.fence_in, n); return; }
+    g.ctx4->End(g.drain_q);
+    g.ctx4->Flush();
+    const ULONGLONG t0 = GetTickCount64();
+    BOOL done = FALSE;
+    while (g.ctx4->GetData(g.drain_q, &done, sizeof(done), 0) != S_OK)
+    {
+        if (GetTickCount64() - t0 > 2000)
+        {
+            Log("[feed32] no-fence: frame %llu's copies did not finish within 2 s", static_cast<unsigned long long>(n));
+            return;
+        }
+        YieldProcessor();
+    }
+}
+
+// D3D11 client, fence_out: "the host has finished frame m". GPU-side with fences; with none,
+// a CPU wait on the value the host mirrors -- it moves on failure and at session end too.
+static void FenceWaitOut(UINT64 m)
+{
+    if (!g.no_fences)
+    {
+        g.ctx4->Wait(g.fence_out, m);   // GPU-side; the host CPU-signals on failure
+        g.fence_wait_queued = true;
+        return;
+    }
+    g.fence_wait_queued = false;
+    const ULONGLONG t0 = GetTickCount64();
+    while (static_cast<UINT64>(InterlockedCompareExchange64(&g.done->completed, 0, 0)) < m)
+    {
+        if (!HostAlive()) return;
+        if (GetTickCount64() - t0 > 2000)
+        {
+            Log("[feed32] no-fence: the host did not finish frame %llu within 2 s", static_cast<unsigned long long>(m));
+            return;
+        }
+        WaitForSingleObject(g.done_evt, 20);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3503,6 +3564,18 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     else
         for (int i = 0; i < FEED_SLOTS; ++i)
             b.tex[i] = reinterpret_cast<uintptr_t>(g.tex_handle[i]);
+    // Wine cannot import a D3D12 fence made in another process (#121): the import faults in
+    // win32u and the game closes a few seconds later. Decided once per host session, since
+    // the host keeps whichever mode it was first asked for.
+    if (g.fence_in == nullptr && !g.no_fences && !g_cfg.wine_fence_import)
+        if (const char *wine = FeedGlWineVersion())
+        {
+            g.no_fences = true;
+            Log("[feed32] running under Wine %s: not importing host64's D3D12 fences (#121); frames are "
+                "synchronised by a device drain and a host-mirrored counter instead. wine_fence_import=1 "
+                "imports them anyway", wine);
+        }
+    if (g.no_fences) b.client_flags |= FEED_BUILD_NO_FENCES;
     // v7: the in-game panel's texture (0 when the host has none). Not when the host creates
     // the set -- it then makes the panel too and ignores this field, so making one here would
     // only burn a texture nobody writes; CastAdoptHostPanel11 opens the host's from the ack.
@@ -3687,7 +3760,37 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
             Log("[feed32] fsr1 intermediate (%ux%u fmt=%u) failed; work_upscale=1 falls back to bilinear", backbuffer_w, backbuffer_h, g.output_fmt);
     }
 
-    if (g.fence_in == nullptr || g.fence_out == nullptr)
+    if (g.no_fences)
+    {
+        // The host created both objects while handling the build, before its ack.
+        if (g.done == nullptr)
+        {
+            char name[128];
+            sprintf_s(name, FEED_DONE_MAP_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
+            g.done_map = OpenFileMappingA(FILE_MAP_READ, FALSE, name);
+            if (g.done_map != nullptr)
+                g.done = static_cast<FeedDoneBlock *>(MapViewOfFile(g.done_map, FILE_MAP_READ, 0, 0, sizeof(FeedDoneBlock)));
+            sprintf_s(name, FEED_DONE_EVT_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
+            g.done_evt = OpenEventA(SYNCHRONIZE, FALSE, name);
+            if (g.done == nullptr || g.done_evt == nullptr)
+            {
+                Log("[feed32] no-fence: the host's done block is missing (error %lu) -- a host64 older than this "
+                    "add-on ignores FEED_BUILD_NO_FENCES; install both halves from the same build", GetLastError());
+                return false;
+            }
+            // The host duplicates its fences into us once per session and repeats the same
+            // values in every ack: close them here, once, unused -- a second close could hit
+            // a handle value that has been reused since.
+            if (ack.fence_in != 0)  CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in)));
+            if (ack.fence_out != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out)));
+        }
+        if (g.drain_q == nullptr)
+        {
+            D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+            if (FAILED(g.dev->CreateQuery(&qd, &g.drain_q))) { Log("[feed32] no-fence: event query failed"); return false; }
+        }
+    }
+    else if (g.fence_in == nullptr || g.fence_out == nullptr)
     {
         ID3D11Device5 *dev5 = nullptr;
         if (FAILED(g.dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&dev5))) || dev5 == nullptr)
@@ -5082,8 +5185,7 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
             if (async_home && g.sent_n != 0)
             {
                 Breadcrumb("waiting for the previous result");
-                g.ctx4->Wait(g.fence_out, g.sent_n);
-                g.fence_wait_queued = true;
+                FenceWaitOut(g.sent_n);
                 g.wait_n            = g.sent_n;
             }
 
@@ -5136,7 +5238,7 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
             bool home_ok = true;
             if (carried) home_ok = BlitHome10(color_res);
 
-            g.ctx4->Signal(g.fence_in, n);
+            FenceSignalIn(n);
             ctx->Flush();
 
             const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
@@ -5165,8 +5267,7 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
             else
             {
                 Breadcrumb("waiting for the host's result");
-                g.ctx4->Wait(g.fence_out, n);
-                g.fence_wait_queued = true;
+                FenceWaitOut(n);
                 g.wait_n            = n;
                 g.sent_n            = n;
                 if (!BlitHome10(color_res)) FeedFail("D3D10 blit home");
@@ -5311,8 +5412,7 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             if (async_home && g.sent_n != 0)
             {
                 Breadcrumb("waiting for the previous result");
-                g.ctx4->Wait(g.fence_out, g.sent_n);   // GPU-side; the host CPU-signals on failure
-                g.fence_wait_queued = true;
+                FenceWaitOut(g.sent_n);   // see FenceWaitOut
                 g.wait_n            = g.sent_n;
             }
 
@@ -5348,7 +5448,7 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             const bool carried = async_home && g.out_valid;
             if (carried) BlitOutputToBackbuffer(ctx, rtv11);
 
-            g.ctx4->Signal(g.fence_in, n);
+            FenceSignalIn(n);
             ctx->Flush();
 
             // Jitter sign: the shift was applied to the sampling grid, so a sample sits at
@@ -5377,8 +5477,7 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             else
             {
                 Breadcrumb("waiting for the host's result");
-                g.ctx4->Wait(g.fence_out, n);       // GPU-side; the host CPU-signals on failure
-                g.fence_wait_queued = true;         // HostDrain must resolve this before any close
+                FenceWaitOut(n);       // see FenceWaitOut
                 g.wait_n            = n;
                 g.sent_n            = n;
                 BlitOutputToBackbuffer(ctx, rtv11);
