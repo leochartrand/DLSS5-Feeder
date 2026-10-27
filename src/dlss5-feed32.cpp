@@ -3008,13 +3008,23 @@ static const char *const kDnlDebugItems[] = { "Off", "What the model sees", "Mod
                                              "Fovea map (foveated NR)" };
 static const char *const kDnlStyleItems[] = { "Default (standard)", "Natural", "Cinematic" };
 static const char *const kDnlGazeItems[]  = { "Fixed (frame centre)", "Gaze over UDP" };
+static const char *const kDnlPassDebugItems[] = { "Off", "What the model sees", "Model answer", "Difference x20" };
 
-enum { DNL_MODEL_FIRST = 6, DNL_FOV_FIRST = 11, DNL_COUNT = 19 };
+// Sections: shared (compose), the fovea pass, the periphery pass, foveation. With the split in two
+// model calls each pass is its own feature with its own network, hand and debug view; otherwise
+// the fovea pass's settings are the model's settings and the periphery section is hidden.
+enum
+{
+    DNL_FOVEA_FIRST = 6, DNL_FOVEA_DEBUG = 6,
+    DNL_PERI_FIRST = 12, DNL_PERI_LAST = 17,
+    DNL_FOV_FIRST = 18, DNL_FOVEATION = 18, DNL_SPLIT = 23, DNL_SPLIT_CALLS = 24, DNL_GLOBAL_SCALE = 25,
+    DNL_GAZE_SOURCE = 26, DNL_COUNT = 29
+};
 
 static const NRSetting kDnl[DNL_COUNT] = {
     { "Enabled",            "Enable Neural Rendering", NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0, nullptr },
-    { "DebugView",          "Debug view",              NR_COMBO,  0.0f,  0.0f,  4.0f, nullptr, kDnlDebugItems, 5,
-      "Fovea map tints the frame by the resolution the model saw there and marks the fovea centre (cross) and the gaze point (ring)." },
+    { "DebugView",          "Debug view (final image)", NR_COMBO, 0.0f,  0.0f,  4.0f, nullptr, kDnlDebugItems, 5,
+      "The finished picture, both passes combined. Fovea map tints the frame by the resolution the model saw there and marks the fovea centre (cross) and the gaze point (ring)." },
     { "DetailStrength",     "Detail strength",         NR_FLOAT,  1.0f,  0.0f,  1.5f, "%.2f", nullptr, 0,
       "How far the frame moves toward the model's answer; 0 = bypass." },
     { "ColourStrength",     "Colour strength",         NR_FLOAT,  0.0f,  0.0f,  1.0f, "%.2f", nullptr, 0,
@@ -3023,11 +3033,23 @@ static const NRSetting kDnl[DNL_COUNT] = {
       "How far the model may move any pixel's luminance, either way." },
     { "WhitePointScale",    "White point scale",       NR_FLOAT,  1.0f,  0.1f,  4.0f, "%.2f", nullptr, 0, nullptr },
 
-    { "Intensity",          "NR intensity",            NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
-    { "StructureIntensity", "Structure intensity",     NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
-    { "GlobalIntensity",    "Global intensity",        NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
-    { "Preset",             "Preset",                  NR_FLOAT,  0.0f,  0.0f,  7.0f, "%.0f", nullptr, 0, nullptr },
-    { "Style",              "Style",                   NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kDnlStyleItems, 3, nullptr },
+    { "FoveaDebugView",     "Debug view##fovea",       NR_COMBO,  0.0f,  0.0f,  3.0f, nullptr, kDnlPassDebugItems, 4,
+      "This pass alone, as the model saw and answered it; outside the crop the input is dimmed. Wins over the periphery pass's debug view." },
+    { "Intensity",          "NR intensity##fovea",     NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "StructureIntensity", "Structure intensity##fovea", NR_FLOAT, 1.0f, 0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "GlobalIntensity",    "Global intensity##fovea", NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "Preset",             "Preset##fovea",           NR_FLOAT,  0.0f,  0.0f,  7.0f, "%.0f", nullptr, 0,
+      "The network: 0 = runtime default (Small FP8), 1 = Legacy." },
+    { "Style",              "Style##fovea",            NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kDnlStyleItems, 3, nullptr },
+
+    { "PeripheryDebugView", "Debug view##periphery",   NR_COMBO,  0.0f,  0.0f,  3.0f, nullptr, kDnlPassDebugItems, 4,
+      "This pass alone, as the model saw and answered it, stretched over the screen." },
+    { "SplitGlobalIntensity", "NR intensity##periphery", NR_FLOAT, 1.0f, 0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "SplitGlobalStructureIntensity", "Structure intensity##periphery", NR_FLOAT, 1.0f, 0.0f, 2.0f, "%.2f", nullptr, 0, nullptr },
+    { "SplitGlobalGlobalIntensity", "Global intensity##periphery", NR_FLOAT, 1.0f, 0.0f, 2.0f, "%.2f", nullptr, 0, nullptr },
+    { "SplitGlobalPreset",  "Preset##periphery",       NR_FLOAT,  1.0f, -1.0f,  7.0f, "%.0f", nullptr, 0,
+      "-1 = the same as the fovea pass. Small FP8 (0) fries at this pass's small size; Legacy (1) holds up." },
+    { "SplitGlobalStyle",   "Style##periphery",        NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kDnlStyleItems, 3, nullptr },
 
     { "Foveation",          "Foveated NR",             NR_BOOL,   0.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
       "Runs the model on a squeezed frame: full resolution inside the fovea, lower beyond it." },
@@ -3035,6 +3057,11 @@ static const NRSetting kDnl[DNL_COUNT] = {
     { "FoveaHeight",        "Fovea height",            NR_FLOAT, 0.50f, 0.05f,  1.0f, "%.2f of the frame", nullptr, 0, nullptr },
     { "FoveaFalloff",       "Falloff",                 NR_FLOAT, 0.10f,  0.0f,  0.5f, "%.2f of the height", nullptr, 0, nullptr },
     { "FoveaEdge",          "Edge resolution",         NR_FLOAT, 0.50f, 0.25f,  1.0f, "%.2f", nullptr, 0, nullptr },
+    { "FoveaSplit",         "Split: full-res crop + low-res frame", NR_BOOL, 0.0f, 0.0f, 1.0f, nullptr, nullptr, 0,
+      "The crop around the gaze runs at full resolution; a small copy of the whole frame sets the tone everywhere." },
+    { "SplitCalls",         "Model calls",             NR_FLOAT,  2.0f,  1.0f,  2.0f, "%.0f", nullptr, 0,
+      "2 = a call per pass (own settings and debug view each), 1 = one call on an atlas of both." },
+    { "GlobalScale",        "Low-res frame",           NR_FLOAT, 0.25f,  0.1f,  0.5f, "%.2f of the frame", nullptr, 0, nullptr },
     { "GazeSource",         "Fovea centre",            NR_COMBO,  0.0f,  0.0f,  1.0f, nullptr, kDnlGazeItems, 2, nullptr },
     { "GazePort",           "Gaze UDP port",           NR_FLOAT, 47620.0f, 1024.0f, 65535.0f, "%.0f", nullptr, 0,
       "Two little-endian float32 (x, y), 0..1 from the top-left, sent to 127.0.0.1 on this port." },
@@ -3068,7 +3095,8 @@ static void WriteDnl(int i)
     char live[MAX_PATH], buf[64];
     DnlPath(live, "dlssnr-linux-live.ini");
     const bool whole = kDnl[i].kind != NR_FLOAT || (kDnl[i].format != nullptr && strncmp(kDnl[i].format, "%.0f", 4) == 0);
-    if (whole) sprintf_s(buf, "%d", static_cast<int>(g_dnl[i] + 0.5f));
+    const float v = g_dnl[i];
+    if (whole) sprintf_s(buf, "%d", v >= 0.0f ? static_cast<int>(v + 0.5f) : -static_cast<int>(-v + 0.5f));   // -1 stays -1
     else       sprintf_s(buf, "%g", g_dnl[i]);
     WritePrivateProfileStringA("DLSSNR", kDnl[i].key, buf, live);
 }
@@ -6370,20 +6398,31 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                    "add-on applies within half a second -- no host restart. Model settings rebuild the "
                    "neural feature, which takes a moment; foveation geometry rebuilds it too.");
         if (!g_dnl_loaded) { ReadDnl(); g_dnl_loaded = true; }
+        const bool split = g_dnl[DNL_FOVEATION] >= 0.5f && g_dnl[DNL_SPLIT] >= 0.5f;
+        const bool two_passes = split && g_dnl[DNL_SPLIT_CALLS] >= 1.5f;
         for (int i = 0; i < DNL_COUNT; ++i)
         {
-            if (i == DNL_MODEL_FIRST)
+            if (i == DNL_FOVEA_FIRST)
             {
                 ImGui::Spacing();
-                ImGui::TextDisabled("Model settings (rebuild the neural feature)");
+                ImGui::TextDisabled(two_passes ? "Fovea pass: full-res crop around the gaze (model settings rebuild it)"
+                                               : "Model settings (rebuild the neural feature)");
+            }
+            else if (i == DNL_PERI_FIRST && two_passes)
+            {
+                ImGui::Spacing();
+                ImGui::TextDisabled("Periphery pass: low-res whole frame, sets the tone (model settings rebuild it)");
             }
             else if (i == DNL_FOV_FIRST)
             {
                 ImGui::Spacing();
                 ImGui::TextDisabled("Foveation");
             }
-            // The gaze port and smoothing only mean something with a gaze source.
-            if ((i == DNL_COUNT - 2 || i == DNL_COUNT - 1) && g_dnl[DNL_COUNT - 3] < 0.5f) continue;
+            // Per-pass debug views and the periphery's own settings only exist with two calls; the
+            // split's own controls only with the split; the gaze port and smoothing only with a gaze source.
+            if (!two_passes && (i == DNL_FOVEA_DEBUG || (i >= DNL_PERI_FIRST && i <= DNL_PERI_LAST))) continue;
+            if (!split && (i == DNL_SPLIT_CALLS || i == DNL_GLOBAL_SCALE)) continue;
+            if (i > DNL_GAZE_SOURCE && g_dnl[DNL_GAZE_SOURCE] < 0.5f) continue;
 
             const NRSetting &s = kDnl[i];
             bool edited = false;
