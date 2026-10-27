@@ -103,6 +103,18 @@
                                       // may spend a little of its OWN time getting a present slot rather
                                       // than dropping the present (issue #15). An unset bit is the old
                                       // behaviour on both sides, so this needs no FEED_IPC_VERSION bump.
+#define FEED_BUILD_NO_FENCES     8u   // the client did not import fence_in/fence_out: Wine cannot import a
+                                      // D3D12 fence made in another process (#121). The client drains its own
+                                      // device before each frame message, so the host CPU-signals fence_in on
+                                      // receipt, and it mirrors fence_out's completed value into the
+                                      // FEED_DONE_* block below for the client to wait on. An unset bit is the
+                                      // old behaviour on both sides; no FEED_IPC_VERSION bump.
+
+// FEED_BUILD_NO_FENCES: fence_out's completed value, mirrored by the host. Named objects
+// work across processes and bitness under Wine, where shared fences do not.
+#define FEED_DONE_MAP_FMT "Local\\dlss5-feed-done.%lu"       // %lu = game PID
+#define FEED_DONE_EVT_FMT "Local\\dlss5-feed-done-evt.%lu"   // auto-reset, set on every change
+struct FeedDoneBlock { volatile LONG64 completed; };      // read with InterlockedCompareExchange64
 
 // FeedBuildAck::flags (v6+)
 #define FEED_ACK_SR_ACTIVE       1u   // the feature is DLSS Super Resolution work -> target (sr_quality says which preset)
