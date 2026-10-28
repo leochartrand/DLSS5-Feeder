@@ -4649,6 +4649,9 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
         {
             ID3D11ShaderResourceView *none[2] = { nullptr, nullptr };
             ctx->PSSetShaderResources(1, 2, none);
+            ID3D11Resource *bb = nullptr;
+            rtv->GetResource(&bb);
+            if (bb != nullptr) { preui::MaybeDump(ctx, bb); bb->Release(); }
         }
     }
 

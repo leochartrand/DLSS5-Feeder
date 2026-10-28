@@ -217,6 +217,52 @@ static bool CopyFinished(ID3D11DeviceContext *ctx, ID3D11Resource *bb)
     return same;
 }
 
+// A one-shot check of the composite, for a session nobody can look at: when preui-dump.request exists
+// beside the game exe, the next composited frame writes preui-dump-{final,ui,pre}.raw there (RGBA8 rows,
+// width x height in preui-dump.txt) and the request is deleted.
+static void WriteRaw(ID3D11DeviceContext *ctx, ID3D11Texture2D *src, const char *path)
+{
+    D3D11_TEXTURE2D_DESC d = {};
+    src->GetDesc(&d);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.MipLevels = 1; sd.ArraySize = 1; sd.SampleDesc = {1, 0};
+    sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+    ID3D11Device *dev = nullptr;
+    ctx->GetDevice(&dev);
+    ID3D11Texture2D *st = nullptr;
+    if (dev && SUCCEEDED(dev->CreateTexture2D(&sd, nullptr, &st)))
+    {
+        ctx->CopyResource(st, src);
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m)))
+        {
+            if (FILE *f = fopen(path, "wb"))
+            {
+                for (UINT y = 0; y < d.Height; ++y) fwrite(static_cast<const char *>(m.pData) + (size_t)y * m.RowPitch, 4, d.Width, f);
+                fclose(f);
+            }
+            ctx->Unmap(st, 0);
+        }
+        st->Release();
+    }
+    if (dev) dev->Release();
+}
+
+static void MaybeDump(ID3D11DeviceContext *ctx, ID3D11Resource *bb)
+{
+    static unsigned tick = 0;
+    if ((++tick % 30) != 0 || GetFileAttributesA("preui-dump.request") == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileA("preui-dump.request");
+    ID3D11Texture2D *t = nullptr;
+    if (FAILED(bb->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&t)))) return;
+    WriteRaw(ctx, t, "preui-dump-final.raw");
+    t->Release();
+    if (g_ui_tex) WriteRaw(ctx, g_ui_tex, "preui-dump-ui.raw");
+    if (g_tex) WriteRaw(ctx, g_tex, "preui-dump-pre.raw");
+    if (FILE *f = fopen("preui-dump.txt", "w")) { fprintf(f, "width=%u\nheight=%u\nformat=%u\n", g_desc.Width, g_desc.Height, (unsigned)g_desc.Format); fclose(f); }
+    g_log("[preui] wrote preui-dump-{final,ui,pre}.raw");
+}
+
 // The pre-UI frame for this frame's feed, or null (no UI drawn, or off). Consumed: the next frame needs
 // its own capture.
 static ID3D11Texture2D *Take(const D3D11_TEXTURE2D_DESC &want)
