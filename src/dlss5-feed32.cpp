@@ -3022,7 +3022,8 @@ static const NRSetting kDnl[DNL_COUNT] = {
 
     { "NREngine",           "Our engine instead of NGX", NR_BOOL, 0.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
       "Runs both passes on our own precompiled Ampere engine (host64\\nr-engine) instead of NVIDIA's NGX. "
-      "The regions snap to its programs' sizes; NGX runs while it loads. The model settings above do not apply to it." },
+      "The regions snap to its programs' sizes; NGX runs while it loads. The intensities, style and skin detail "
+      "above apply to it live, as inputs to the network, like NGX; the preset does not (it runs its own programs)." },
     { "EngineHistory",      "Engine history",          NR_FLOAT,  1.0f,  0.0f,  1.0f, "%.2f", nullptr, 0,
       "NVIDIA's temporal loop: the network sees its previous answer (reprojected) and decides per pixel how "
       "much of it to keep. This scales that decision: 1 = as NVIDIA's library does it, 0 = single frames." },
