@@ -2955,9 +2955,9 @@ static const char *const kDnlPassDebugItems[] = { "Off", "What the model sees", 
 enum
 {
     DNL_FOVEA_FIRST = 6, DNL_FOVEA_DEBUG = 6,
-    DNL_PERI_FIRST = 12, DNL_PERI_LAST = 18,
-    DNL_FOV_FIRST = 19, DNL_FOVEATION = 19, DNL_SPLIT = 24, DNL_SPLIT_CALLS = 25, DNL_GLOBAL_SCALE = 26,
-    DNL_GRADE_BLUR = 27, DNL_GAZE_SOURCE = 28, DNL_ENGINE = 31, DNL_COUNT = 33
+    DNL_PERI_FIRST = 13, DNL_PERI_LAST = 19,
+    DNL_FOV_FIRST = 20, DNL_FOVEATION = 20, DNL_SPLIT = 25, DNL_SPLIT_CALLS = 26, DNL_GLOBAL_SCALE = 27,
+    DNL_GRADE_BLUR = 28, DNL_GAZE_SOURCE = 29, DNL_ENGINE = 32, DNL_COUNT = 34
 };
 
 static const NRSetting kDnl[DNL_COUNT] = {
@@ -2980,6 +2980,9 @@ static const NRSetting kDnl[DNL_COUNT] = {
     { "Preset",             "Preset##fovea",           NR_FLOAT,  0.0f,  0.0f,  7.0f, "%.0f", nullptr, 0,
       "The network: 0 = runtime default (Small FP8), 1 = Legacy." },
     { "Style",              "Style##fovea",            NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kDnlStyleItems, 3, nullptr },
+    { "SkinStructureStrength", "Skin detail",          NR_FLOAT, -1.0f, -1.0f,  2.0f, "%.2f", nullptr, 0,
+      "How much detail the network adds on skin, which it finds itself (faces, hands); -1 = the same as Structure "
+      "intensity. NVIDIA's SkinStructureStrength control; both passes use it." },
 
     { "PeripheryPass",      "Run the periphery pass",  NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
       "Off skips this model call: outside the crop you see the game's own frame, lit by whatever shaders run before the feed (e.g. Glamarye's AO and fake GI)." },
