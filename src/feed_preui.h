@@ -210,7 +210,8 @@ static bool CopyFinished(ID3D11DeviceContext *ctx, ID3D11Resource *bb)
     if (FAILED(bb->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&t)))) return false;
     D3D11_TEXTURE2D_DESC d = {};
     t->GetDesc(&d);
-    const bool same = d.Width == g_desc.Width && d.Height == g_desc.Height && d.Format == g_desc.Format;
+    // A typeless surface and its UNORM view format are one copy family (the backbuffer is often the typed one).
+    const bool same = d.Width == g_desc.Width && d.Height == g_desc.Height && ViewFormat(d.Format) == ViewFormat(g_desc.Format);
     if (same) ctx->CopyResource(g_ui_tex, t);
     t->Release();
     return same;
@@ -228,7 +229,7 @@ static ID3D11Texture2D *Take(const D3D11_TEXTURE2D_DESC &want)
     if (!g_on || !g_captured || g_tex == nullptr) { if (g_on) ++none; return nullptr; }
     g_captured = false;
     g_scene_rt = 0;
-    if (want.Width != g_desc.Width || want.Height != g_desc.Height || want.Format != g_desc.Format)
+    if (want.Width != g_desc.Width || want.Height != g_desc.Height || ViewFormat(want.Format) != ViewFormat(g_desc.Format))
     {
         static bool said = false;
         if (!said)
