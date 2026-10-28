@@ -3009,9 +3009,10 @@ static const NRSetting kDnl[DNL_COUNT] = {
       "7 screen pixels with our engine). Higher keeps only broad brightness and colour, so small motion (panning, "
       "idle breathing) cannot make it crawl; too high may leave soft halos where bright meets dark. No trails: "
       "it is spatial only." },
-    { "Relight",            "Relighting kept",         NR_FLOAT,  1.0f,  0.0f,  1.0f, "%.2f", nullptr, 0,
-      "How much of the model's broad brightness and colour change reaches the picture: 1 = all of it, 0 = none "
-      "(only its fine detail stays, in the crop). Lower it when the model relights the scene." },
+    { "Relight",            "Relighting kept (0 = details only)", NR_FLOAT,  1.0f,  0.0f,  1.0f, "%.2f", nullptr, 0,
+      "How much of the model's broad brightness and colour change (its relighting) reaches the picture: 1 = all "
+      "of it. 0 = details only: the crop keeps the model's fine detail without its lighting, the periphery shows "
+      "the game's own frame, and the periphery's model call is skipped (faster)." },
     { "RelightDarkenOnly",  "Relighting may only darken", NR_BOOL, 0.0f, 0.0f,  1.0f, nullptr, nullptr, 0,
       "The broad change may only darken, and only brightness (no colour shift): roughly ambient occlusion." },
     { "GazeSource",         "Fovea centre",            NR_COMBO,  0.0f,  0.0f,  1.0f, nullptr, kDnlGazeItems, 2, nullptr },
