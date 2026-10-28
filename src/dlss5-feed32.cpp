@@ -57,6 +57,7 @@
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
+#include "feed_vksync.h" // vk_sync: the no-fence handoff on the GPU (DXVK interop + shared timeline semaphores)
 static void FeedOnVkDeviceGeneration();
 #define FEED_VK_DEVICE_GENERATION_CALLBACK FeedOnVkDeviceGeneration
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
@@ -413,6 +414,7 @@ static int       g_work_resolution_ui = 100;
 static int       g_ui_probe = 0;          // ui_probe=N: log N frames of draws (feed_uiprobe.h)
 static int       g_ui_probe_after = 600;  // ui_probe_after: from this present on
 static int       g_preui = 0;             // preui=1: the neural pass runs before the game's UI (feed_preui.h)
+static int       g_vk_sync = 0;           // vk_sync=1: hand frames over on the GPU under Wine (feed_vksync.h)
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
 
@@ -493,7 +495,7 @@ static const char *const kCfgSavedKeys[] = {
     "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "log_frames",
     "host_window", "host_gpu_priority", "work_resolution", "work_upscale", "work_sharpness", "async_home",
     "mv_scale_x", "mv_scale_y", "cast_key", "cast_mods", "cast_scale", "cast_mode", "cast_anchor",
-    "settle_evals", "hold_strength", "hold_tolerance", "preui",
+    "settle_evals", "hold_strength", "hold_tolerance", "preui", "vk_sync",
 };
 
 static bool CfgKeyIsSaved(const char *key)
@@ -544,7 +546,7 @@ static void CfgSave()
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
             g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance);
-    fprintf(f, "preui=%d\n", g_preui);
+    fprintf(f, "preui=%d\nvk_sync=%d\n", g_preui, g_vk_sync);
     if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
@@ -624,6 +626,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "ui_probe")       == 0) g_ui_probe       = iv < 0 ? 0 : iv > 8 ? 8 : iv;
         else if (_stricmp(key, "ui_probe_after") == 0) g_ui_probe_after = iv;
         else if (_stricmp(key, "preui")          == 0) g_preui          = iv != 0 ? 1 : 0;   // 2 was this mode's old number
+        else if (_stricmp(key, "vk_sync")        == 0) g_vk_sync        = iv != 0 ? 1 : 0;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -781,6 +784,11 @@ struct Feed32
     HANDLE           done_map, done_evt;
     FeedDoneBlock   *done;
     ID3D11Query     *drain_q;
+    // vk_sync (FEED_ACK_VK_SYNC): the host's handoff semaphores, imported into DXVK's device. Signal(fence_in)
+    // is then a GPU signal of vks.in after DXVK's flush, Wait(fence_out) a GPU wait on vks.out.
+    bool             vk_sync;
+    FeedVkSync       vks;
+    IFeedDxvkInterop *dxvk;
     ID3D11DeviceContext4 *ctx4;
     ID3D11Device    *dev;         // not owned
     ID3D11Multithread *mt;        // immediate-context serialization, restored on teardown
@@ -1099,6 +1107,22 @@ static void HostDrain()
                 static_cast<unsigned long long>(g.wait_n));
         return;
     }
+    // vk_sync: the wait on vks.out is on the GPU. Give the host its 2 s, then release it ourselves.
+    if (g.vk_sync)
+    {
+        g.fence_wait_queued = false;
+        const ULONGLONG t0 = GetTickCount64();
+        while (FeedVkSyncValue(&g.vks, g.vks.out) < g.wait_n && GetTickCount64() - t0 < 2000 &&
+               g.hproc != nullptr && WaitForSingleObject(g.hproc, 0) == WAIT_TIMEOUT)
+            Sleep(1);
+        if (FeedVkSyncValue(&g.vks, g.vks.out) < g.wait_n)
+        {
+            Log("[feed32] drain: frame %llu not signalled by the host; releasing the GPU wait ourselves",
+                static_cast<unsigned long long>(g.wait_n));
+            FeedVkSyncCpuSignal(&g.vks, g.vks.out, g.wait_n);
+        }
+        return;
+    }
     // No-fence client: every wait was a CPU wait that already returned; nothing is queued.
     if (g.no_fences) { g.fence_wait_queued = false; return; }
     if (g.fence_out == nullptr) return;
@@ -1171,6 +1195,14 @@ static void HostClose()
     if (g.done_evt != nullptr) { CloseHandle(g.done_evt); g.done_evt = nullptr; }
     SafeRelease(g.drain_q);
     g.no_fences = false;
+    if (g.vks.dev != nullptr)
+    {
+        if (g.vks.in != VK_NULL_HANDLE)  g.vks.DestroySemaphore_(g.vks.dev, g.vks.in, nullptr);
+        if (g.vks.out != VK_NULL_HANDLE) g.vks.DestroySemaphore_(g.vks.dev, g.vks.out, nullptr);
+    }
+    g.vks = FeedVkSync();
+    SafeRelease(g.dxvk);
+    g.vk_sync = false;
     if (g.gl.ok && g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
     {
         if (g.gl_sem_in  != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_in);  g.gl_sem_in  = 0; }
@@ -1247,6 +1279,18 @@ static bool HostAlive()
 static void FenceSignalIn(UINT64 n)
 {
     if (!g.no_fences) { g.ctx4->Signal(g.fence_in, n); return; }
+    if (g.vk_sync)
+    {
+        // DXVK's flush returns once this frame's work is on its Vulkan queue; the signal goes after it. A
+        // value the host already released from the CPU (a frame it queued ahead and let go) stays as it is.
+        g.dxvk->FlushRenderingCommands();
+        if (FeedVkSyncValue(&g.vks, g.vks.in) >= n) return;
+        g.dxvk->LockSubmissionQueue();
+        const bool ok = FeedVkSyncSubmit(&g.vks, g.vks.in, n, false);
+        g.dxvk->ReleaseSubmissionQueue();
+        if (!ok) Log("[feed32] vk_sync: frame %llu's signal could not be submitted", static_cast<unsigned long long>(n));
+        return;
+    }
     g.ctx4->End(g.drain_q);
     g.ctx4->Flush();
     const ULONGLONG t0 = GetTickCount64();
@@ -1269,6 +1313,16 @@ static void FenceWaitOut(UINT64 m)
     if (!g.no_fences)
     {
         g.ctx4->Wait(g.fence_out, m);   // GPU-side; the host CPU-signals on failure
+        g.fence_wait_queued = true;
+        return;
+    }
+    if (g.vk_sync)
+    {
+        // Ahead of everything recorded after this: DXVK submits it after our wait, on the same queue.
+        g.dxvk->FlushRenderingCommands();
+        g.dxvk->LockSubmissionQueue();
+        FeedVkSyncSubmit(&g.vks, g.vks.out, m, true);
+        g.dxvk->ReleaseSubmissionQueue();
         g.fence_wait_queued = true;
         return;
     }
@@ -3799,6 +3853,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
                 "imports them anyway", wine);
         }
     if (g.no_fences) b.client_flags |= FEED_BUILD_NO_FENCES;
+    if (g.no_fences && g_vk_sync) b.client_flags |= FEED_BUILD_VK_SYNC;
     // v7: the in-game panel's texture (0 when the host has none). Not when the host creates
     // the set -- it then makes the panel too and ignores this field, so making one here would
     // only burn a texture nobody writes; CastAdoptHostPanel11 opens the host's from the ack.
@@ -4002,6 +4057,36 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
                 Log("[feed32] no-fence: the host's done block is missing (error %lu) -- a host64 older than this "
                     "add-on ignores FEED_BUILD_NO_FENCES; install both halves from the same build", GetLastError());
                 return false;
+            }
+            // vk_sync: import the handoff semaphores into DXVK's device (once per session, like the
+            // fences below). Failing that, frames go without FEED_FRAME_VK_IN and the host CPU-signals.
+            if ((ack.flags & FEED_ACK_VK_SYNC) != 0)
+            {
+                const HANDLE vin = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.vk_in));
+                const HANDLE vout = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.vk_out));
+                VkInstance inst = nullptr;
+                VkPhysicalDevice phys = nullptr;
+                VkDevice vdev = nullptr;
+                VkQueue vq = nullptr;
+                uint32_t family = 0;
+                if (SUCCEEDED(g.dev->QueryInterface(__uuidof(IFeedDxvkInterop), reinterpret_cast<void **>(&g.dxvk))) &&
+                    g.dxvk != nullptr)
+                {
+                    g.dxvk->GetVulkanHandles(&inst, &phys, &vdev);
+                    g.dxvk->GetSubmissionQueue(&vq, &family);
+                }
+                if (g.dxvk != nullptr && FeedVkSyncLoad(&g.vks, inst, vdev, vq) &&
+                    (g.vks.in = FeedVkSyncImport(&g.vks, vin)) != VK_NULL_HANDLE &&
+                    (g.vks.out = FeedVkSyncImport(&g.vks, vout)) != VK_NULL_HANDLE)
+                {
+                    g.vk_sync = true;
+                    Log("[feed32] vk_sync: frames are handed over on the GPU (DXVK queue family %u)", family);
+                }
+                else
+                    Log("[feed32] vk_sync: could not import the host's semaphores into DXVK's device (%s); "
+                        "staying on the no-fence handoff", g.dxvk == nullptr ? "no DXVK interop" : "import failed");
+                if (vin != nullptr) CloseHandle(vin);
+                if (vout != nullptr) CloseHandle(vout);
             }
             // The host duplicates its fences into us once per session and repeats the same
             // values in every ack: close them here, once, unused -- a second close could hit
@@ -4911,7 +4996,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
 
             const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset), 0.0f, 0.0f,
                                       static_cast<uint32_t>(g_cfg.settle_evals),
-                                      g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                      (g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u) | (g.vk_sync ? FEED_FRAME_VK_IN : 0u),
                                       g_cfg.hold_strength, g_cfg.hold_tolerance };
             if (!PipeWriteFrame(fm))
                 HostLost("frame message failed");
@@ -5194,7 +5279,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
             const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset), 0.0f, 0.0f,
                                       static_cast<uint32_t>(g_cfg.settle_evals),
-                                      g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                      (g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u) | (g.vk_sync ? FEED_FRAME_VK_IN : 0u),
                                       g_cfg.hold_strength, g_cfg.hold_tolerance };
             bool delivered = false;
             if (!PipeWriteFrame(fm))
@@ -5487,7 +5572,7 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
             const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
                                       g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f,
                                       static_cast<uint32_t>(g_cfg.settle_evals),
-                                      g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                      (g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u) | (g.vk_sync ? FEED_FRAME_VK_IN : 0u),
                                       g_cfg.hold_strength, g_cfg.hold_tolerance };
             const bool sent = PipeWriteFrame(fm);
             if (sent && g.sr_active) ++g.jitter_index;
@@ -5702,7 +5787,7 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
                                       g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f,
                                       static_cast<uint32_t>(g_cfg.settle_evals),
-                                      g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                      (g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u) | (g.vk_sync ? FEED_FRAME_VK_IN : 0u),
                                       g_cfg.hold_strength, g_cfg.hold_tolerance };
             const bool sent = PipeWriteFrame(fm);
             if (sent && g.sr_active) ++g.jitter_index;
@@ -6333,6 +6418,13 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   "draws the UI over the result itself, so the UI is never processed. Off: DLSS 5 runs "
                                   "on the finished frame at Present, UI included. Direct3D 11 games (and wrappers "
                                   "like dgVoodoo).");
+    bool vk_sync = g_vk_sync != 0;
+    if (ImGui::Checkbox("GPU handoff under Wine/Proton", &vk_sync)) { g_vk_sync = vk_sync ? 1 : 0; dirty = true; }
+    ImGui::SameLine(); HelpMarker("Wine cannot share D3D12 fences between the game and the helper, so frames are "
+                                  "handed over through the CPU (a device drain here, a signal there). On: two "
+                                  "shared Vulkan semaphores carry the handoff on the GPU instead, through DXVK and "
+                                  "vkd3d-proton. Applies from the next host start (Restart the DLSS 5 host). "
+                                  "Falls back to the CPU handoff by itself if either side cannot set it up.");
     if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
     if (ImGui::SliderInt("Settle evaluates (extra, per frame)", &g_cfg.settle_evals, 0, 8)) dirty = true;
     ImGui::SameLine(); HelpMarker("Experimental. After the real evaluate, the helper runs the same frame N more times "

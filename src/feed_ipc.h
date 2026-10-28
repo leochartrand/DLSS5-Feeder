@@ -70,7 +70,7 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 11u
+#define FEED_IPC_VERSION 12u
 
 // Version 11 added FeedFrameMsg::settle_evals (experimentHold): how many extra evaluates of the
 // SAME frame the host runs after the real one, with zero motion and no reset, so the neural
@@ -110,6 +110,11 @@
                                       // FEED_DONE_* block below for the client to wait on. An unset bit is the
                                       // old behaviour on both sides; no FEED_IPC_VERSION bump.
 
+#define FEED_BUILD_VK_SYNC      16u   // with FEED_BUILD_NO_FENCES: the client can hand frames over on the GPU through
+                                      // two Vulkan timeline semaphores the host makes (feed_vksync.h). The host
+                                      // answers FEED_ACK_VK_SYNC with their handles in vk_in / vk_out, or nothing
+                                      // (then both sides stay on the no-fence handoff).
+
 // FEED_BUILD_NO_FENCES: fence_out's completed value, mirrored by the host. Named objects
 // work across processes and bitness under Wine, where shared fences do not.
 #define FEED_DONE_MAP_FMT "Local\\dlss5-feed-done.%lu"       // %lu = game PID
@@ -120,6 +125,7 @@ struct FeedDoneBlock { volatile LONG64 completed; };      // read with Interlock
 #define FEED_ACK_SR_ACTIVE       1u   // the feature is DLSS Super Resolution work -> target (sr_quality says which preset)
 #define FEED_ACK_SR_UNAVAILABLE  2u   // SR was asked for, no preset covers the ratio: the build failed on purpose,
                                       // rebuild with target == work (DLAA)
+#define FEED_ACK_VK_SYNC         4u   // v12+: vk_in / vk_out hold the handoff semaphores (FEED_BUILD_VK_SYNC)
 #define FEED_PIPE_FMT    "\\\\.\\pipe\\dlss5-feed.%lu"   // %lu = game PID
 
 // The bytes a version-1 client sends as its hello: magic, version, pid.
@@ -216,6 +222,8 @@ struct FeedBuildAck     // host -> game
                                  // process of the HOST-created panel texture (they cannot export one for the
                                  // host to open); 0 = none. RGBA8, FeedHelloAck::panel_* in size.
     uint64_t panel_size;         // v7+: its GetResourceAllocationInfo size, for the GL import
+    uint64_t vk_in;              // v12+, FEED_ACK_VK_SYNC: opaque Win32 handles valid in the GAME process of the
+    uint64_t vk_out;             // host's handoff semaphores (in: the game signals frame n; out: the host does)
 };
 
 struct FeedWindowMsg    // game -> host ('W'), v8+: resize the host window, live
@@ -249,5 +257,8 @@ struct FeedFrameMsg     // game -> host, per frame
                                    // captured on the first flagged frame, with zero motion, until the flag
                                    // drops. Separates "the model drifts on a constant input" from "the
                                    // game's frame keeps changing after the camera stops".
+#define FEED_FRAME_VK_IN      2u   // v12+, vk_sync: the client's GPU signals the handoff semaphore "in" with n after
+                                   // its copies (no device drain before this message). Without it the host
+                                   // CPU-signals "in" (and fence_in) on receipt, as in the no-fence handoff.
 
 #pragma pack(pop)

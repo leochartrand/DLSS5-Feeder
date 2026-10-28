@@ -41,6 +41,7 @@
 #include "../src/feed_ngx_trust.h" // after a failure: why NGX would not load the driver core here
 #include "../src/feed_crash.h" // naming a C++ throw and the modules it came through, likewise
 #include "../src/feed_ipc.h"
+#include "../src/feed_vksync.h" // vk_sync: the handoff on the GPU through Vulkan timeline semaphores
 #include "../src/feed_fmt.h"
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
 #include "../src/feed_opti.h"  // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
@@ -1142,13 +1143,90 @@ static void HostReadSettleEvals(const char *ini)
             "in a game the add-on's slider decides", n, n);
 }
 
+// vk_sync (FEED_BUILD_VK_SYNC, feed_vksync.h): the handoff semaphores, on this device's Vulkan queue through
+// vkd3d-proton's interop. Set up once per session at the first build that asks; then the GPU waits on
+// "in" where it waited on fence_in, and signals "out" next to every fence_out signal. fence_out and its
+// CPU mirror stay as they were, for everything that reads them on the CPU.
+static bool               g_vk = false;
+static bool               g_vk_tried = false;
+static FeedVkSync         g_vks;
+static IFeedVkd3dInterop *g_vk_interop = nullptr;
+static HANDLE             g_vk_game_in = nullptr, g_vk_game_out = nullptr;   // valid in the game process
+
+static bool VkSyncSetup(HANDLE hgame)
+{
+    VkInstance inst = nullptr;
+    VkPhysicalDevice phys = nullptr;
+    VkDevice dev = nullptr;
+    VkQueue queue = nullptr;
+    UINT32 family = 0;
+    if (FAILED(h.dev->QueryInterface(__uuidof(IFeedVkd3dInterop), reinterpret_cast<void **>(&g_vk_interop))) ||
+        g_vk_interop == nullptr)
+    { Log("[host] vk_sync: the D3D12 device has no vkd3d-proton interop; staying on the no-fence handoff"); return false; }
+    if (FAILED(g_vk_interop->GetVulkanHandles(&inst, &phys, &dev)) ||
+        FAILED(g_vk_interop->GetVulkanQueueInfo(h.queue, &queue, &family)) || !FeedVkSyncLoad(&g_vks, inst, dev, queue))
+    { Log("[host] vk_sync: could not reach this device's Vulkan queue; staying on the no-fence handoff"); return false; }
+    g_vks.in = FeedVkSyncNewTimeline(&g_vks, true);
+    g_vks.out = FeedVkSyncNewTimeline(&g_vks, true);
+    HANDLE hin = g_vks.in != VK_NULL_HANDLE ? FeedVkSyncExport(&g_vks, g_vks.in) : nullptr;
+    HANDLE hout = g_vks.out != VK_NULL_HANDLE ? FeedVkSyncExport(&g_vks, g_vks.out) : nullptr;
+    const bool ok = hin != nullptr && hout != nullptr &&
+                    DuplicateHandle(GetCurrentProcess(), hin, hgame, &g_vk_game_in, 0, FALSE, DUPLICATE_SAME_ACCESS) &&
+                    DuplicateHandle(GetCurrentProcess(), hout, hgame, &g_vk_game_out, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    if (hin != nullptr) CloseHandle(hin);
+    if (hout != nullptr) CloseHandle(hout);
+    if (!ok)
+    {
+        Log("[host] vk_sync: could not create or share the handoff semaphores (error %lu); staying on the no-fence "
+            "handoff", GetLastError());
+        return false;
+    }
+    Log("[host] vk_sync: frames are handed over on the GPU (two timeline semaphores, queue family %u)", family);
+    return true;
+}
+
+// The GPU waits for / signals frame v on the handoff, in order with this queue's D3D12 work.
+static void VkSyncQueue(VkSemaphore sem, UINT64 v, bool wait)
+{
+    if (FAILED(g_vk_interop->LockCommandQueue(h.queue))) return;
+    if (!FeedVkSyncSubmit(&g_vks, sem, v, wait))
+    {
+        static int said = 0;
+        if (said++ < 4) Log("[host] vk_sync: the %s of frame %llu could not be submitted", wait ? "wait" : "signal",
+                            (unsigned long long)v);
+    }
+    g_vk_interop->UnlockCommandQueue(h.queue);
+}
+
+// Wait for the game's copies of frame v: on the GPU with vk_sync, else behind fence_in.
+static void WaitIn(UINT64 v)
+{
+    if (g_vk) VkSyncQueue(g_vks.in, v, true);
+    else h.queue->Wait(h.fence_in, v);
+}
+
+// Frame v is done, after everything queued so far.
+static void SignalOut(UINT64 v)
+{
+    h.queue->Signal(h.fence_out, v);
+    if (g_vk) VkSyncQueue(g_vks.out, v, false);
+}
+
+// The CPU signals the game's wait for frame v -- a failure, or the session ending: it must never hang on us.
+static void CpuSignalOut(UINT64 v)
+{
+    h.fence_out->Signal(v);
+    if (g_vk) FeedVkSyncCpuSignal(&g_vks, g_vks.out, v);
+}
+
 // Let a frame queued ahead run now, on whatever inputs are there: before anything that waits for the
 // queue to drain or rebuilds what the evaluate reads. Its fence_out signal is early for that one
 // frame; the frame's own message, when it comes, takes the normal path.
 static void AheadRelease(const char *why)
 {
     if (g_ahead_n == 0) return;
-    if (h.fence_in != nullptr) h.fence_in->Signal(g_ahead_n);
+    if (g_vk) FeedVkSyncCpuSignal(&g_vks, g_vks.in, g_ahead_n);   // the game's later signal of it is skipped
+    else if (h.fence_in != nullptr) h.fence_in->Signal(g_ahead_n);
     static int said = 0;
     if (said++ < 8) Log("[host] submit-ahead: released frame %llu early (%s)", (unsigned long long)g_ahead_n, why);
     g_ahead_n = 0;
@@ -3464,6 +3542,11 @@ static int Serve(DWORD game_pid)
             h.async_home = (b.client_flags & FEED_BUILD_ASYNC_HOME) != 0;
             if ((b.client_flags & FEED_BUILD_NO_FENCES) != 0 && !g_no_fences)
                 g_no_fences = DoneMirrorStart(game_pid);
+            if ((b.client_flags & FEED_BUILD_VK_SYNC) != 0 && g_no_fences && !g_vk_tried)
+            {
+                g_vk_tried = true;
+                g_vk = VkSyncSetup(hgame);
+            }
             static bool said_handoff = false;
             if (h.async_home != was_async || !said_handoff)
             {
@@ -3694,6 +3777,12 @@ static int Serve(DWORD game_pid)
             back.output_fmt = static_cast<uint32_t>(out_fmt);
             for (int i = 0; i < FEED_SLOTS; ++i) { back.tex[i] = game_tex[i]; back.tex_size[i] = tex_size[i]; }
             back.panel_tex  = game_panel;
+            if (g_vk)
+            {
+                back.flags |= FEED_ACK_VK_SYNC;
+                back.vk_in  = reinterpret_cast<uint64_t>(g_vk_game_in);
+                back.vk_out = reinterpret_cast<uint64_t>(g_vk_game_out);
+            }
             back.panel_size = game_panel != 0 ? h.panel_size : 0;
             WriteFull(pipe, &back, sizeof(back));
             if (!ok && DeviceRemoved("a rebuild")) break;   // the ack went out; retrying here is pointless
@@ -3791,7 +3880,7 @@ static int Serve(DWORD game_pid)
             // Windows ghosts it as "Not Responding" within seconds while the game runs on.
             if (h.feature == nullptr && !transport_only)
             {
-                h.fence_out->Signal(fm.n);
+                CpuSignalOut(fm.n);
                 PumpPresent();
                 if (g_device_removed) break;
                 continue;
@@ -3810,8 +3899,15 @@ static int Serve(DWORD game_pid)
             const bool ahead = g_ahead_n != 0 && g_ahead_n == fm.n;
             if (!ahead) AheadRelease("its frame number did not come");
             g_ahead_n = 0;
-            if (g_no_fences) h.fence_in->Signal(fm.n);   // with real fences the game's GPU signals it
-            if (!ahead) h.queue->Wait(h.fence_in, fm.n);
+            // With real fences, or a vk_sync frame (FEED_FRAME_VK_IN), the game's GPU signals it; a no-fence
+            // client drained its device before sending fm, so the permission is ours to give -- on both
+            // objects, since a frame queued ahead may already wait on either.
+            if (g_no_fences && (fm.flags & FEED_FRAME_VK_IN) == 0)
+            {
+                h.fence_in->Signal(fm.n);
+                if (g_vk) FeedVkSyncCpuSignal(&g_vks, g_vks.in, fm.n);
+            }
+            if (!ahead) WaitIn(fm.n);
 
             bool done = false;
             if (ahead)
@@ -3857,7 +3953,7 @@ static int Serve(DWORD game_pid)
 
             if (done)
             {
-                if (!ahead) h.queue->Signal(h.fence_out, fm.n);
+                if (!ahead) SignalOut(fm.n);
                 if (!transport_only && !outcome_logged && ++outcome_frames >= 300)
                 {
                     outcome_logged = true;
@@ -3900,7 +3996,7 @@ static int Serve(DWORD game_pid)
             }
             else
             {
-                h.fence_out->Signal(fm.n);     // CPU-signal so the game never hangs on us
+                CpuSignalOut(fm.n);            // CPU-signal so the game never hangs on us
                 if (DeviceRemoved("an evaluate")) break;
             }
 
@@ -3980,12 +4076,12 @@ static int Serve(DWORD game_pid)
                 !(fm.flags & FEED_FRAME_HOLD_INPUT) && fm.settle_evals == 0 && fm.hold_strength <= 0.0f)
             {
                 const UINT64 next = fm.n + 1;
-                h.queue->Wait(h.fence_in, next);
+                WaitIn(next);
                 if (Evaluate(h.tex[FEED_COLOR], h.out_scratch != nullptr ? h.out_scratch : h.tex[FEED_OUTPUT],
                              h.tex[FEED_DEPTH], h.tex[FEED_MV], h.width, h.height, 0, mvsx, mvsy,
                              fm.jitter_x, fm.jitter_y, 0, 0.0f, fm.hold_tolerance))
                 {
-                    h.queue->Signal(h.fence_out, next);
+                    SignalOut(next);
                     g_ahead_n = next;
                 }
                 // A failed early evaluate queued only the wait, which the next message releases.
@@ -4009,6 +4105,7 @@ static int Serve(DWORD game_pid)
     AheadRelease("the session ended");
     if (!g_device_removed) WaitFenceValue(h.fence, h.fence_value, 2000);   // nothing to wait for on a dead device
     if (h.fence_out != nullptr) h.fence_out->Signal(UINT64_MAX);
+    if (g_vk) FeedVkSyncCpuSignal(&g_vks, g_vks.out, UINT64_MAX);   // capped: the game's waits are all below it
     DoneMirrorStop();
     Log("[host] pending game fence waits released; exiting%s", g_device_removed ? " (device removed)" : "");
     return g_device_removed ? 3 : 0;
