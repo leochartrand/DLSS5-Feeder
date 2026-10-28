@@ -412,7 +412,7 @@ static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 
 static int       g_work_resolution_ui = 100;
 static int       g_ui_probe = 0;          // ui_probe=N: log N frames of draws (feed_uiprobe.h)
 static int       g_ui_probe_after = 600;  // ui_probe_after: from this present on
-static int       g_preui = 0;             // preui=1/2: feed the frame before the UI (feed_preui.h)
+static int       g_preui = 0;             // preui=1: the neural pass runs before the game's UI (feed_preui.h)
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
 
@@ -623,7 +623,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
         else if (_stricmp(key, "ui_probe")       == 0) g_ui_probe       = iv < 0 ? 0 : iv > 8 ? 8 : iv;
         else if (_stricmp(key, "ui_probe_after") == 0) g_ui_probe_after = iv;
-        else if (_stricmp(key, "preui")          == 0) g_preui          = iv == 1 || iv == 2 ? iv : 0;
+        else if (_stricmp(key, "preui")          == 0) g_preui          = iv != 0 ? 1 : 0;   // 2 was this mode's old number
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -2177,7 +2177,7 @@ static bool OnOpenOverlay(reshade::api::effect_runtime *rt, bool open, reshade::
     return false;   // never veto
 }
 
-// preui=2: the effect chain (motion estimator, DLSS5_Feed -> the neural pass and its result) on the scene
+// preui=1: the effect chain (motion estimator, DLSS5_Feed -> the neural pass and its result) on the scene
 // surface just before the game's first UI draw, in a clean device state; the game's own state is put back
 // whole afterwards, so its UI draw goes on as if nothing ran.
 static bool RenderBeforeUi(reshade::api::command_list *cmd, reshade::api::resource_view rtv)
@@ -3646,7 +3646,6 @@ static bool MakeBlitShaders()
     ps->Release();
     resample->Release();
     if (FAILED(hr)) { Log("[feed32] blit shader creation failed 0x%08X", hr); return false; }
-    preui::CreateShader(g.dev, compile);
 
     D3D11_SAMPLER_DESC sd = {};
     // Linear: below 100% this sampler both downsamples the colour and upscales the result.
@@ -4634,7 +4633,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     vp.Height   = static_cast<float>(g.backbuffer_height);
     vp.MaxDepth = 1.0f;
     ID3D11SamplerState *smps[] = { g.blit_sampler };
-    // Colour only: the neural pass replaces colour, the target's alpha stays the game's. With preui=2 the
+    // Colour only: the neural pass replaces colour, the target's alpha stays the game's. With preui=1 the
     // game draws its UI over this target next, and UI that blends by destination alpha needs the scene's.
     static ID3D11BlendState *rgb_only = nullptr;
     if (rgb_only == nullptr)
@@ -4676,36 +4675,15 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
         ctx->Draw(3, 0);
         src = g.easu_srv;
     }
-    // preui: the plain blit becomes the UI composite (the game's pixel wherever its UI changed it).
-    bool ui = false;
-    if (!easu && !rcas && !scaled)
-    {
-        ID3D11Resource *bb = nullptr;
-        rtv->GetResource(&bb);
-        if (bb != nullptr) { ui = preui::CopyFinished(ctx, bb); bb->Release(); }
-    }
     if (rcas || !easu)
     {
         ID3D11ShaderResourceView *unbind = nullptr;
         ctx->PSSetShaderResources(0, 1, &unbind);      // easu_tex leaves the OM before it enters the PS
         ID3D11RenderTargetView *target[] = { rtv };
         ctx->OMSetRenderTargets(1, target, nullptr);
-        ctx->PSSetShader(ui ? preui::g_ui_ps : rcas ? g.rcas_ps : g.blit_ps, nullptr, 0);
+        ctx->PSSetShader(rcas ? g.rcas_ps : g.blit_ps, nullptr, 0);
         ctx->PSSetShaderResources(0, 1, &src);
-        if (ui)
-        {
-            ID3D11ShaderResourceView *more[2] = { preui::g_ui_srv, preui::g_srv };
-            ctx->PSSetShaderResources(1, 2, more);
-        }
         ctx->Draw(3, 0);
-        if (ui)
-        {
-            ID3D11ShaderResourceView *none[2] = { nullptr, nullptr };
-            ctx->PSSetShaderResources(1, 2, none);
-            ID3D11Resource *bb = nullptr;
-            rtv->GetResource(&bb);
-            if (bb != nullptr) { preui::MaybeDump(ctx, bb); bb->Release(); }
-        }
     }
 
     ID3D11ShaderResourceView *no_srv = nullptr;
@@ -5606,7 +5584,7 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
     ID3D11Texture2D *depth = AsTexture2D(depth_res, &dd);
     if (color == nullptr || mv == nullptr || depth == nullptr)
     { SafeRelease(color); SafeRelease(mv); SafeRelease(depth); return; }
-    // preui=2 feeds the game's own scene surface, which wrappers make TYPELESS; the shared set is built and
+    // preui=1 feeds the game's own scene surface, which wrappers make TYPELESS; the shared set is built and
     // viewed in its UNORM format, the same as the backbuffer's, so frames with and without UI share it.
     cd.Format = preui::ViewFormat(cd.Format);
 
@@ -5692,8 +5670,7 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
                 HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
             }
             Breadcrumb("preparing work-resolution inputs");
-            ID3D11Texture2D *pre_ui = preui::Take(cd);   // the frame before the UI, when it was captured
-            if (!CopyOrResampleInputs(ctx, pre_ui != nullptr ? pre_ui : color, mv, depth,
+            if (!CopyOrResampleInputs(ctx, color, mv, depth,
                                       reinterpret_cast<ID3D11ShaderResourceView *>(mv_srv.handle),
                                       reinterpret_cast<ID3D11ShaderResourceView *>(d_srv.handle),
                                       cd.Width, cd.Height))
@@ -6350,14 +6327,12 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   "instead of inside its frame, which is what lifts the frame-rate ceiling. "
                                   "Costs one frame of latency on the DLSS output; the temporal history hides it. "
                                   "Turn it off to get the original same-frame behaviour back.");
-    static const char *kUiModes[] = { "Off: the whole frame, UI included", "Before the UI (the game draws its UI after)",
-                                      "Composite (old: estimates the UI afterwards)" };
-    int ui_mode = g_preui;
-    if (ImGui::Combo("Game UI", &ui_mode, kUiModes, 3)) { g_preui = ui_mode; dirty = true; }
-    ImGui::SameLine(); HelpMarker("Before the UI: DLSS 5 runs on the game's frame just before it draws its UI, and the "
-                                  "game then draws the UI over the result itself, so the UI is never processed. "
-                                  "Off: DLSS 5 runs on the finished frame at Present, UI included. Composite is the "
-                                  "earlier approach, kept for comparison. Direct3D 11 games (and wrappers like dgVoodoo).");
+    bool before_ui = g_preui != 0;
+    if (ImGui::Checkbox("Run before the game's UI", &before_ui)) { g_preui = before_ui ? 1 : 0; dirty = true; }
+    ImGui::SameLine(); HelpMarker("DLSS 5 runs on the game's frame just before it draws its UI, and the game then "
+                                  "draws the UI over the result itself, so the UI is never processed. Off: DLSS 5 runs "
+                                  "on the finished frame at Present, UI included. Direct3D 11 games (and wrappers "
+                                  "like dgVoodoo).");
     if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
     if (ImGui::SliderInt("Settle evaluates (extra, per frame)", &g_cfg.settle_evals, 0, 8)) dirty = true;
     ImGui::SameLine(); HelpMarker("Experimental. After the real evaluate, the helper runs the same frame N more times "
