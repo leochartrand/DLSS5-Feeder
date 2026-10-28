@@ -48,6 +48,7 @@
 #define ImTextureID ImU64   // required by reshade_overlay.hpp before including imgui.h
 #include <imgui.h>
 #include <reshade.hpp>
+#include "feed_uiprobe.h"
 
 #include "feed_ipc.h"
 #include "feed_crash.h" // naming a C++ throw, shared with the 64-bit add-on and the host
@@ -408,6 +409,8 @@ struct Cfg
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0, 0, 0, 0,
                      /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f };
 static int       g_work_resolution_ui = 100;
+static int       g_ui_probe = 0;          // ui_probe=N: log N frames of draws (feed_uiprobe.h)
+static int       g_ui_probe_after = 600;  // ui_probe_after: from this present on
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
 
@@ -615,6 +618,8 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "settle_evals")   == 0) next.settle_evals   = iv < 0 ? 0 : iv > 8 ? 8 : iv;
         else if (_stricmp(key, "hold_strength")  == 0) next.hold_strength  = val < 0.0f ? 0.0f : val > 1.0f ? 1.0f : val;
         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
+        else if (_stricmp(key, "ui_probe")       == 0) g_ui_probe       = iv < 0 ? 0 : iv > 8 ? 8 : iv;
+        else if (_stricmp(key, "ui_probe_after") == 0) g_ui_probe_after = iv;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -2170,6 +2175,12 @@ static bool OnOpenOverlay(reshade::api::effect_runtime *rt, bool open, reshade::
 
 static void OnPresent(reshade::api::effect_runtime *rt)
 {
+    static bool probe_armed = false;
+    if (!probe_armed && g_ui_probe > 0)
+    {
+        probe_armed = true;
+        uiprobe::Register(g_ui_probe, g_ui_probe_after, &Log);
+    }
     // The host buttons are drained HERE, not in FeedFrame. FeedFrame only runs when the
     // DLSS5_Feed technique renders, so with the effect missing or disabled, effects toggled
     // off, or mode=0, "Start the DLSS 5 host" would have done nothing at all -- and that is
