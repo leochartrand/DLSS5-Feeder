@@ -383,11 +383,19 @@ static ID3D11Texture2D *Take(const D3D11_TEXTURE2D_DESC &want)
 static void Register(void (*log)(const char *, ...), int mode,
                      bool (*render_here)(reshade::api::command_list *, reshade::api::resource_view))
 {
-    if (g_on) return;
-    g_on = true;
+    static bool registered = false;
     g_log = log;
-    g_mode = mode == 2 && render_here != nullptr ? 2 : 1;
     g_render_here = render_here;
+    g_mode = mode == 2 && render_here != nullptr ? 2 : 1;
+    g_on = true;
+    g_captured = false;
+    g_scene_rt = 0;
+    if (registered)
+    {
+        log(g_mode == 2 ? "[preui] on (native)" : "[preui] on (composite)");
+        return;
+    }
+    registered = true;
     reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBind);
     reshade::register_event<reshade::addon_event::draw>(OnDraw);
     reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
@@ -395,6 +403,23 @@ static void Register(void (*log)(const char *, ...), int mode,
     reshade::register_event<reshade::addon_event::present>(OnPresent);
     log(g_mode == 2 ? "[preui] on (native): the effects and the neural pass run before the game's UI, which is drawn over the result"
                     : "[preui] on (composite): the neural pass gets the frame before the UI; UI pixels keep the game's own colour");
+}
+
+// The mode from the cfg or the page (0 off, 1 composite, 2 native), applied from the next draw. The events
+// stay registered once armed; off makes them return at once.
+static void SetMode(int mode, void (*log)(const char *, ...),
+                    bool (*render_here)(reshade::api::command_list *, reshade::api::resource_view))
+{
+    const int now = g_on ? g_mode : 0;
+    if (mode == now) return;
+    if (mode == 0)
+    {
+        g_on = false;
+        g_captured = false;
+        log("[preui] off: the neural pass gets the finished frame, UI included");
+        return;
+    }
+    Register(log, mode, render_here);
 }
 
 }  // namespace preui

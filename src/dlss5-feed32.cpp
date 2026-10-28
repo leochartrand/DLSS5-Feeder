@@ -493,7 +493,7 @@ static const char *const kCfgSavedKeys[] = {
     "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "log_frames",
     "host_window", "host_gpu_priority", "work_resolution", "work_upscale", "work_sharpness", "async_home",
     "mv_scale_x", "mv_scale_y", "cast_key", "cast_mods", "cast_scale", "cast_mode", "cast_anchor",
-    "settle_evals", "hold_strength", "hold_tolerance",
+    "settle_evals", "hold_strength", "hold_tolerance", "preui",
 };
 
 static bool CfgKeyIsSaved(const char *key)
@@ -544,6 +544,7 @@ static void CfgSave()
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
             g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance);
+    fprintf(f, "preui=%d\n", g_preui);
     if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
@@ -2223,12 +2224,7 @@ static void OnPresent(reshade::api::effect_runtime *rt)
         probe_armed = true;
         uiprobe::Register(g_ui_probe, g_ui_probe_after, &Log);
     }
-    static bool preui_armed = false;
-    if (!preui_armed && g_preui)
-    {
-        preui_armed = true;
-        preui::Register(&Log, g_preui, &RenderBeforeUi);
-    }
+    preui::SetMode(g_preui, &Log, &RenderBeforeUi);   // the cfg and the page can change it any time
     // The host buttons are drained HERE, not in FeedFrame. FeedFrame only runs when the
     // DLSS5_Feed technique renders, so with the effect missing or disabled, effects toggled
     // off, or mode=0, "Start the DLSS 5 host" would have done nothing at all -- and that is
@@ -4638,7 +4634,25 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     vp.Height   = static_cast<float>(g.backbuffer_height);
     vp.MaxDepth = 1.0f;
     ID3D11SamplerState *smps[] = { g.blit_sampler };
-    ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    // Colour only: the neural pass replaces colour, the target's alpha stays the game's. With preui=2 the
+    // game draws its UI over this target next, and UI that blends by destination alpha needs the scene's.
+    static ID3D11BlendState *rgb_only = nullptr;
+    if (rgb_only == nullptr)
+    {
+        D3D11_BLEND_DESC bd = {};
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN |
+                                                   D3D11_COLOR_WRITE_ENABLE_BLUE;
+        ID3D11Device *dev = nullptr;
+        ctx->GetDevice(&dev);
+        if (dev != nullptr) { dev->CreateBlendState(&bd, &rgb_only); dev->Release(); }
+    }
+    ctx->OMSetBlendState(rgb_only, nullptr, 0xFFFFFFFF);
     ctx->OMSetDepthStencilState(nullptr, 0);
     ctx->RSSetState(nullptr);
     ctx->RSSetViewports(1, &vp);
@@ -6336,6 +6350,14 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   "instead of inside its frame, which is what lifts the frame-rate ceiling. "
                                   "Costs one frame of latency on the DLSS output; the temporal history hides it. "
                                   "Turn it off to get the original same-frame behaviour back.");
+    static const char *kUiModes[] = { "Off: the whole frame, UI included", "Before the UI (the game draws its UI after)",
+                                      "Composite (old: estimates the UI afterwards)" };
+    int ui_mode = g_preui;
+    if (ImGui::Combo("Game UI", &ui_mode, kUiModes, 3)) { g_preui = ui_mode; dirty = true; }
+    ImGui::SameLine(); HelpMarker("Before the UI: DLSS 5 runs on the game's frame just before it draws its UI, and the "
+                                  "game then draws the UI over the result itself, so the UI is never processed. "
+                                  "Off: DLSS 5 runs on the finished frame at Present, UI included. Composite is the "
+                                  "earlier approach, kept for comparison. Direct3D 11 games (and wrappers like dgVoodoo).");
     if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
     if (ImGui::SliderInt("Settle evaluates (extra, per frame)", &g_cfg.settle_evals, 0, 8)) dirty = true;
     ImGui::SameLine(); HelpMarker("Experimental. After the real evaluate, the helper runs the same frame N more times "
