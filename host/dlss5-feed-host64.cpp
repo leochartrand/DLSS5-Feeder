@@ -1114,10 +1114,19 @@ static void HostEnableDred(const char *ini)
 // enough for OptiScaler (it hands our parameter object to the real DLSS and multiplies its
 // own NR vectors by it); a consumer that ignores the scale would double-advance instead.
 static int   g_settle_evals = 0;
+// [DLSS5Host] SubmitAhead=1: record and submit frame n+1's evaluate right after frame n, behind a GPU
+// wait on fence_in, instead of when n+1's message arrives. The host's CPU work (NGX, ReShade, the
+// neural consumer's recording) then leaves the frame's critical path: when the message comes, the
+// only thing left is to release the wait. The early evaluate takes frame n's per-frame values (no
+// reset); hold and settle frames are never recorded ahead. g_ahead_n is the frame queued that way.
+static bool   g_submit_ahead = false;
+static UINT64 g_ahead_n      = 0;
 static float g_test_hold    = 0.0f;   // [DLSS5Host] HoldStrength, --test only: proves the stabiliser pass runs
 
 static void HostReadSettleEvals(const char *ini)
 {
+    g_submit_ahead = GetPrivateProfileIntA("DLSS5Host", "SubmitAhead", 0, ini) != 0;
+    if (g_submit_ahead) Log("[host] submit-ahead: each frame's evaluate is queued behind fence_in one frame early");
     int n = GetPrivateProfileIntA("DLSS5Host", "SettleEvals", 0, ini);
     if (n < 0) n = 0;
     if (n > 8) n = 8;
@@ -1131,6 +1140,18 @@ static void HostReadSettleEvals(const char *ini)
     if (n > 0)
         Log("[host] settle: %d extra zero-motion evaluate(s) per frame for --test ([DLSS5Host] SettleEvals=%d); "
             "in a game the add-on's slider decides", n, n);
+}
+
+// Let a frame queued ahead run now, on whatever inputs are there: before anything that waits for the
+// queue to drain or rebuilds what the evaluate reads. Its fence_out signal is early for that one
+// frame; the frame's own message, when it comes, takes the normal path.
+static void AheadRelease(const char *why)
+{
+    if (g_ahead_n == 0) return;
+    if (h.fence_in != nullptr) h.fence_in->Signal(g_ahead_n);
+    static int said = 0;
+    if (said++ < 8) Log("[host] submit-ahead: released frame %llu early (%s)", (unsigned long long)g_ahead_n, why);
+    g_ahead_n = 0;
 }
 
 // The name DRED reports for the list every frame is recorded into. That list is handed to
@@ -3377,6 +3398,14 @@ static int Serve(DWORD game_pid)
             // per-evaluate call could not present (issue #15).
             if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT)
             {
+                // A frame queued ahead holds the queue behind fence_in, which (no-fence mode) only
+                // this thread releases when the message comes: a Present that waited on the GPU
+                // here would never return. Keep the window pumped and present later.
+                if (g_ahead_n != 0)
+                {
+                    PumpMessagesGuarded();
+                    continue;
+                }
                 PumpRetireOwedPresents();
                 PumpPresent();
                 if (g_device_removed) break;   // PumpPresent saw the device go (#119)
@@ -3391,6 +3420,7 @@ static int Serve(DWORD game_pid)
         }
         if (!tag_read) { if (!g_device_removed) Log("[host] pipe closed by the game"); break; }
 
+        if (tag == 'B' || tag == 'W') AheadRelease(tag == 'B' ? "a build" : "a window resize");
         if (tag == 'B')
         {
             FeedBuild b = {};
@@ -3775,11 +3805,18 @@ static int Serve(DWORD game_pid)
             // and CPU-signals fence_out below -- the never-hang guarantee is unchanged.
             // No-fence client: it drained its own device before sending fm, so its copies
             // have landed and the permission is ours to give.
-            if (g_no_fences) h.fence_in->Signal(fm.n);
-            h.queue->Wait(h.fence_in, fm.n);
+            // Queued ahead: releasing the wait is all this frame needs. Any other frame number
+            // (a skipped or repeated one) lets the queued one go and takes the normal path.
+            const bool ahead = g_ahead_n != 0 && g_ahead_n == fm.n;
+            if (!ahead) AheadRelease("its frame number did not come");
+            g_ahead_n = 0;
+            if (g_no_fences) h.fence_in->Signal(fm.n);   // with real fences the game's GPU signals it
+            if (!ahead) h.queue->Wait(h.fence_in, fm.n);
 
             bool done = false;
-            if (transport_only)
+            if (ahead)
+                done = true;   // evaluated and fence_out-signalled when it was queued
+            else if (transport_only)
             {
                 if (BeginCommands())
                 {
@@ -3820,7 +3857,7 @@ static int Serve(DWORD game_pid)
 
             if (done)
             {
-                h.queue->Signal(h.fence_out, fm.n);
+                if (!ahead) h.queue->Signal(h.fence_out, fm.n);
                 if (!transport_only && !outcome_logged && ++outcome_frames >= 300)
                 {
                     outcome_logged = true;
@@ -3937,6 +3974,22 @@ static int Serve(DWORD game_pid)
             g_pace_presents += 1 + (owed_before - g_present_owed);
             PumpPresent(true);   // per evaluate, deliberately -- see PumpPresent
             if (g_device_removed) break;   // the present is where a hung device shows first (#119)
+
+            // Submit-ahead: the next frame's evaluate, queued now behind its fence_in value.
+            if (g_submit_ahead && done && !transport_only && h.feature != nullptr && warm_done &&
+                !(fm.flags & FEED_FRAME_HOLD_INPUT) && fm.settle_evals == 0 && fm.hold_strength <= 0.0f)
+            {
+                const UINT64 next = fm.n + 1;
+                h.queue->Wait(h.fence_in, next);
+                if (Evaluate(h.tex[FEED_COLOR], h.out_scratch != nullptr ? h.out_scratch : h.tex[FEED_OUTPUT],
+                             h.tex[FEED_DEPTH], h.tex[FEED_MV], h.width, h.height, 0, mvsx, mvsy,
+                             fm.jitter_x, fm.jitter_y, 0, 0.0f, fm.hold_tolerance))
+                {
+                    h.queue->Signal(h.fence_out, next);
+                    g_ahead_n = next;
+                }
+                // A failed early evaluate queued only the wait, which the next message releases.
+            }
         }
         else
         {
@@ -3953,6 +4006,7 @@ static int Serve(DWORD game_pid)
     // own queue, then release every wait the game could possibly hold.
     if (pending) { CancelIo(pipe); DWORD got = 0; GetOverlappedResult(pipe, &ov_tag, &got, TRUE); }
     CloseHandle(ev_tag);
+    AheadRelease("the session ended");
     if (!g_device_removed) WaitFenceValue(h.fence, h.fence_value, 2000);   // nothing to wait for on a dead device
     if (h.fence_out != nullptr) h.fence_out->Signal(UINT64_MAX);
     DoneMirrorStop();
