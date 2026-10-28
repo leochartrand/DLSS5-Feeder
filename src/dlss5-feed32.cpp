@@ -2957,7 +2957,7 @@ enum
     DNL_FOVEA_FIRST = 6, DNL_FOVEA_DEBUG = 6,
     DNL_PERI_FIRST = 12, DNL_PERI_LAST = 18,
     DNL_FOV_FIRST = 19, DNL_FOVEATION = 19, DNL_SPLIT = 24, DNL_SPLIT_CALLS = 25, DNL_GLOBAL_SCALE = 26,
-    DNL_GAZE_SOURCE = 27, DNL_COUNT = 30
+    DNL_GAZE_SOURCE = 27, DNL_ENGINE = 30, DNL_COUNT = 32
 };
 
 static const NRSetting kDnl[DNL_COUNT] = {
@@ -3007,6 +3007,13 @@ static const NRSetting kDnl[DNL_COUNT] = {
     { "GazePort",           "Gaze UDP port",           NR_FLOAT, 47620.0f, 1024.0f, 65535.0f, "%.0f", nullptr, 0,
       "Two little-endian float32 (x, y), 0..1 from the top-left, sent to 127.0.0.1 on this port." },
     { "GazeSmoothMs",       "Gaze smoothing",          NR_FLOAT, 30.0f,  0.0f, 200.0f, "%.0f ms", nullptr, 0, nullptr },
+
+    { "NREngine",           "Our engine instead of NGX", NR_BOOL, 0.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
+      "Runs both passes on our own precompiled Ampere engine (host64\\nr-engine) instead of NVIDIA's NGX. "
+      "Both regions snap to its 1152x640 field; NGX runs while it loads. The model settings above do not apply to it." },
+    { "EngineHistory",      "Engine history",          NR_FLOAT,  0.7f,  0.0f, 0.95f, "%.2f", nullptr, 0,
+      "How much of the engine's last answer, reprojected, carries into this frame's. It sees one frame at a "
+      "time, so without this it flickers; too high smears moving detail." },
 };
 
 static float g_dnl[DNL_COUNT];
@@ -6319,11 +6326,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                 ImGui::Spacing();
                 ImGui::TextDisabled("Foveation");
             }
+            else if (i == DNL_ENGINE && two_passes)
+            {
+                ImGui::Spacing();
+                ImGui::TextDisabled("Engine (split in two calls)");
+            }
             // Per-pass debug views and the periphery's own settings only exist with two calls; the
             // split's own controls only with the split; the gaze port and smoothing only with a gaze source.
             if (!two_passes && (i == DNL_FOVEA_DEBUG || (i >= DNL_PERI_FIRST && i <= DNL_PERI_LAST))) continue;
             if (!split && (i == DNL_SPLIT_CALLS || i == DNL_GLOBAL_SCALE)) continue;
-            if (i > DNL_GAZE_SOURCE && g_dnl[DNL_GAZE_SOURCE] < 0.5f) continue;
+            if (i > DNL_GAZE_SOURCE && i < DNL_ENGINE && g_dnl[DNL_GAZE_SOURCE] < 0.5f) continue;
+            if (i >= DNL_ENGINE && (!two_passes || (i > DNL_ENGINE && g_dnl[DNL_ENGINE] < 0.5f))) continue;
 
             const NRSetting &s = kDnl[i];
             bool edited = false;
