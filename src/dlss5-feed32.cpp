@@ -2954,10 +2954,10 @@ static const char *const kDnlPassDebugItems[] = { "Off", "What the model sees", 
 // the fovea pass's settings are the model's settings and the periphery section is hidden.
 enum
 {
-    DNL_FOVEA_FIRST = 6, DNL_FOVEA_DEBUG = 6,
-    DNL_PERI_FIRST = 13, DNL_PERI_LAST = 19,
-    DNL_FOV_FIRST = 20, DNL_FOVEATION = 20, DNL_SPLIT = 25, DNL_SPLIT_CALLS = 26, DNL_GLOBAL_SCALE = 27,
-    DNL_GRADE_BLUR = 28, DNL_GAZE_SOURCE = 29, DNL_ENGINE = 32, DNL_COUNT = 34
+    DNL_FOVEA_FIRST = 8, DNL_FOVEA_DEBUG = 8,
+    DNL_PERI_FIRST = 20, DNL_PERI_LAST = 28,
+    DNL_FOV_FIRST = 29, DNL_FOVEATION = 29, DNL_SPLIT = 34, DNL_SPLIT_CALLS = 35, DNL_GLOBAL_SCALE = 36,
+    DNL_GRADE_BLUR = 37, DNL_CROP_SNAP = 40, DNL_GAZE_SOURCE = 41, DNL_ENGINE = 44, DNL_COUNT = 46
 };
 
 static const NRSetting kDnl[DNL_COUNT] = {
@@ -2971,6 +2971,12 @@ static const NRSetting kDnl[DNL_COUNT] = {
     { "HighlightGuard",     "Highlight guard",         NR_FLOAT,  2.0f,  1.0f,  8.0f, "%.1fx", nullptr, 0,
       "How far the model may move any pixel's luminance, either way." },
     { "WhitePointScale",    "White point scale",       NR_FLOAT,  1.0f,  0.1f,  4.0f, "%.2f", nullptr, 0, nullptr },
+    { "DLAA",               "Anti-aliasing (DLAA)",    NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
+      "DLSS-SR at full resolution on the frame before the neural pass. Off copies the frame through instead: "
+      "no DLSS anti-aliasing, about 2-3 ms less per frame at 4K." },
+    { "BeforeUpscale",      "Run before the upscale",  NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
+      "When the host upscales (work resolution below 100%), the neural pass runs on DLSS-SR's input instead of "
+      "its output. No effect at 100%, where the pass always runs after DLAA." },
 
     { "FoveaDebugView",     "Debug view##fovea",       NR_COMBO,  0.0f,  0.0f,  3.0f, nullptr, kDnlPassDebugItems, 4,
       "This pass alone, as the model saw and answered it; outside the crop the input is dimmed. Wins over the periphery pass's debug view." },
@@ -2983,6 +2989,17 @@ static const NRSetting kDnl[DNL_COUNT] = {
     { "SkinStructureStrength", "Skin detail",          NR_FLOAT, -1.0f, -1.0f,  2.0f, "%.2f", nullptr, 0,
       "How much detail the network adds on skin, which it finds itself (faces, hands); -1 = the same as Structure "
       "intensity. NVIDIA's SkinStructureStrength control; both passes use it." },
+    { "UseAutoMask",        "Skin mask",               NR_FLOAT,  1.0f, -1.0f,  1.0f, "%.0f", nullptr, 0,
+      "NVIDIA's automatic skin / other split, which the skin detail setting acts through: 1 on, 0 off "
+      "(structure applies everywhere), -1 the library default. Our engine treats -1 as on." },
+    { "UICorrection",       "UI correction",           NR_FLOAT,  1.0f, -1.0f,  1.0f, "%.0f", nullptr, 0,
+      "NGX's DLSSNR.UICorrection: 1 on, 0 off, -1 the library default. NGX only; our engine does not have it." },
+    { "MaskBlendMode",      "Mask blend mode",         NR_FLOAT, -1.0f, -1.0f,  3.0f, "%.0f", nullptr, 0,
+      "NGX's DLSSNR.MaskBlendMode, -1 = the library default. NGX only; our engine does not have it." },
+    { "GlobalToneStrength", "Global tone strength",    NR_FLOAT, -1.0f, -1.0f,  2.0f, "%.2f", nullptr, 0,
+      "NGX's DLSSNR.GlobalToneStrength, -1 = not set. NGX only: it is not one of the network's inputs." },
+    { "ScalingRatio",       "Scaling ratio",           NR_FLOAT,  0.0f,  0.0f,  4.0f, "%.2f", nullptr, 0,
+      "NGX's DLSSNR.ScalingRatio, 0 = not set. NGX only." },
 
     { "PeripheryPass",      "Run the periphery pass",  NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
       "Off skips this model call: outside the crop you see the game's own frame, lit by whatever shaders run before the feed (e.g. Glamarye's AO and fake GI)." },
@@ -2994,6 +3011,11 @@ static const NRSetting kDnl[DNL_COUNT] = {
     { "SplitGlobalPreset",  "Preset##periphery",       NR_FLOAT,  1.0f, -1.0f,  7.0f, "%.0f", nullptr, 0,
       "-1 = the same as the fovea pass. Small FP8 (0) fries at this pass's small size; Legacy (1) holds up." },
     { "SplitGlobalStyle",   "Style##periphery",        NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kDnlStyleItems, 3, nullptr },
+    { "SplitGlobalSkinStructure", "Skin detail##periphery", NR_FLOAT, -1.0f, -1.0f, 2.0f, "%.2f", nullptr, 0,
+      "How much detail this pass's network adds on skin; -1 = this pass's own structure intensity." },
+    { "GlobalEvery",        "Run every",               NR_FLOAT,  1.0f,  1.0f,  4.0f, "%.0f frames", nullptr, 0,
+      "Run this pass only every Nth frame; between runs its last tone is carried along the motion vectors "
+      "(Tone smoothing). Saves its cost N-1 frames out of N." },
 
     { "Foveation",          "Foveated NR",             NR_BOOL,   0.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
       "Runs the model on a squeezed frame: full resolution inside the fovea, lower beyond it." },
@@ -3011,6 +3033,14 @@ static const NRSetting kDnl[DNL_COUNT] = {
       "7 screen pixels with our engine). Higher keeps only broad brightness and colour, so small motion (panning, "
       "idle breathing) cannot make it crawl; too high may leave soft halos where bright meets dark. No trails: "
       "it is spatial only." },
+    { "ToneSmoothing",      "Tone smoothing",          NR_FLOAT,  0.0f,  0.0f, 0.95f, "%.2f", nullptr, 0,
+      "Weight of the carried tone where the scene is still (below the dead band). Steadies the periphery's "
+      "tone; can leave trails behind moving things." },
+    { "ToneDeadband",       "Tone dead band",          NR_FLOAT, 0.01f,  0.0f,  0.1f, "%.3f", nullptr, 0,
+      "Input change below which Tone smoothing holds the tone; above it the tone follows at once." },
+    { "CropSnap",           "Crop snap",               NR_FLOAT, 32.0f,  0.0f, 256.0f, "%.0f px", nullptr, 0,
+      "The crop moves on this grid, holding still until the gaze has moved 3/4 of a step; 0 or 1 = it follows "
+      "the gaze pixel by pixel (its edge then crawls)." },
     { "GazeSource",         "Fovea centre",            NR_COMBO,  0.0f,  0.0f,  1.0f, nullptr, kDnlGazeItems, 2, nullptr },
     { "GazePort",           "Gaze UDP port",           NR_FLOAT, 47620.0f, 1024.0f, 65535.0f, "%.0f", nullptr, 0,
       "Two little-endian float32 (x, y), 0..1 from the top-left, sent to 127.0.0.1 on this port." },
@@ -3023,6 +3053,7 @@ static const NRSetting kDnl[DNL_COUNT] = {
     { "EngineHistory",      "Engine history",          NR_FLOAT,  1.0f,  0.0f,  1.0f, "%.2f", nullptr, 0,
       "NVIDIA's temporal loop: the network sees its previous answer (reprojected) and decides per pixel how "
       "much of it to keep. This scales that decision: 1 = as NVIDIA's library does it, 0 = single frames." },
+
 };
 
 static float g_dnl[DNL_COUNT];
@@ -6343,7 +6374,7 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
             // Per-pass debug views and the periphery's own settings only exist with two calls; the
             // split's own controls only with the split; the gaze port and smoothing only with a gaze source.
             if (!two_passes && (i == DNL_FOVEA_DEBUG || (i >= DNL_PERI_FIRST && i <= DNL_PERI_LAST))) continue;
-            if (!split && (i == DNL_SPLIT_CALLS || i == DNL_GLOBAL_SCALE || i == DNL_GRADE_BLUR)) continue;
+            if (!split && i >= DNL_SPLIT_CALLS && i <= DNL_CROP_SNAP) continue;   // the split's own controls
             if (i > DNL_GAZE_SOURCE && i < DNL_ENGINE && g_dnl[DNL_GAZE_SOURCE] < 0.5f) continue;
             if (i >= DNL_ENGINE && (!two_passes || (i > DNL_ENGINE && g_dnl[DNL_ENGINE] < 0.5f))) continue;
 
