@@ -356,7 +356,7 @@ static void MaybeDump(ID3D11DeviceContext *ctx, ID3D11Resource *bb)
 static ID3D11Texture2D *Take(const D3D11_TEXTURE2D_DESC &want)
 {
     static uint64_t asked = 0, fed = 0, none = 0;
-    if (g_on && (++asked % 1800) == 0)
+    if (g_on && g_mode == 1 && (++asked % 1800) == 0)
         g_log("[preui] last 1800 frames: %llu fed the pre-UI frame, %llu had no capture",
               (unsigned long long)fed, (unsigned long long)none), fed = none = 0;
     g_used = false;
