@@ -161,8 +161,9 @@ static void OnPresent(reshade::api::command_queue *, reshade::api::swapchain *sc
 }
 
 // The UI composite for the blit home: a copy of the backbuffer as the game finished it (UI included), made
-// just before the result is drawn over it, and the pixel shader that keeps the game's pixel wherever that
-// copy differs from the pre-UI frame.
+// just before the result is drawn over it, and the pixel shader. Where the UI changed a pixel a little (a
+// translucent overlay: vignettes, grunge borders, fades) its change is added onto the model's answer;
+// where it changed it a lot (opaque text and icons) the game's pixel is kept as is.
 static ID3D11Texture2D          *g_ui_tex = nullptr;
 static ID3D11ShaderResourceView *g_ui_srv = nullptr;
 static ID3D11PixelShader        *g_ui_ps  = nullptr;
@@ -178,9 +179,10 @@ static const char kUiSrc[] =
     "  float3 nr = nr_tex.Sample(smp, i.uv).rgb;\n"
     "  int3 p = int3(i.pos.xy, 0);\n"
     "  float3 ui = ui_tex.Load(p).rgb;\n"
-    "  float3 d = abs(ui - pre_tex.Load(p).rgb);\n"
-    "  float m = saturate((max(d.r, max(d.g, d.b)) - 1.5 / 255.0) * 24.0);\n"
-    "  return float4(lerp(nr, ui, m), 1.0); }\n";
+    "  float3 delta = ui - pre_tex.Load(p).rgb;\n"
+    "  float d = max(abs(delta.r), max(abs(delta.g), abs(delta.b)));\n"
+    "  float opaque = saturate((d - 0.2) * 5.0);\n"
+    "  return float4(lerp(saturate(nr + delta), ui, opaque), 1.0); }\n";
 
 // The composite's shader, from the add-on's D3DCompile (null: no composite, the blit stays plain).
 template <typename Compile>
