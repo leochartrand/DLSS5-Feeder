@@ -220,11 +220,27 @@ static bool CopyFinished(ID3D11DeviceContext *ctx, ID3D11Resource *bb)
 // its own capture.
 static ID3D11Texture2D *Take(const D3D11_TEXTURE2D_DESC &want)
 {
+    static uint64_t asked = 0, fed = 0, none = 0;
+    if (g_on && (++asked % 1800) == 0)
+        g_log("[preui] last 1800 frames: %llu fed the pre-UI frame, %llu had no capture",
+              (unsigned long long)fed, (unsigned long long)none), fed = none = 0;
     g_used = false;
-    if (!g_on || !g_captured || g_tex == nullptr) return nullptr;
+    if (!g_on || !g_captured || g_tex == nullptr) { if (g_on) ++none; return nullptr; }
     g_captured = false;
     g_scene_rt = 0;
-    if (want.Width != g_desc.Width || want.Height != g_desc.Height || want.Format != g_desc.Format) return nullptr;
+    if (want.Width != g_desc.Width || want.Height != g_desc.Height || want.Format != g_desc.Format)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            g_log("[preui] the backbuffer (%ux%u fmt %u) is not the surface the frame was finished in (%ux%u fmt %u): "
+                  "feeding the backbuffer", want.Width, want.Height, (unsigned)want.Format, g_desc.Width,
+                  g_desc.Height, (unsigned)g_desc.Format);
+        }
+        return nullptr;
+    }
+    ++fed;
     g_used = true;
     return g_tex;
 }
