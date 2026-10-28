@@ -26,6 +26,7 @@ static ID3D11Texture2D          *g_tex = nullptr;   // the pre-UI frame
 static ID3D11ShaderResourceView *g_srv = nullptr;
 static D3D11_TEXTURE2D_DESC      g_desc = {};
 static uint64_t g_captures = 0;
+static DWORD    g_capture_tid = 0;         // the thread the last capture ran on (the feed's should match)
 static void (*g_log)(const char *, ...) = nullptr;
 
 static bool In(const uint64_t (&set)[4], uint64_t h)
@@ -97,6 +98,7 @@ static void Capture(ID3D11DeviceContext *ctx, ID3D11Resource *src)
     ctx->CopyResource(g_tex, t);
     t->Release();
     g_captured = true;
+    g_capture_tid = GetCurrentThreadId();
     if (++g_captures == 1) g_log("[preui] first pre-UI capture (the UI starts after a full-screen pass into the final surface)");
 }
 
@@ -250,17 +252,31 @@ static void WriteRaw(ID3D11DeviceContext *ctx, ID3D11Texture2D *src, const char 
 
 static void MaybeDump(ID3D11DeviceContext *ctx, ID3D11Resource *bb)
 {
+    // Six consecutive frames: preui-dump-{final,ui,pre}-<k>.raw, k = 0..5.
     static unsigned tick = 0;
-    if ((++tick % 30) != 0 || GetFileAttributesA("preui-dump.request") == INVALID_FILE_ATTRIBUTES) return;
-    DeleteFileA("preui-dump.request");
+    static int left = 0;
+    if (left == 0)
+    {
+        if ((++tick % 30) != 0 || GetFileAttributesA("preui-dump.request") == INVALID_FILE_ATTRIBUTES) return;
+        DeleteFileA("preui-dump.request");
+        left = 6;
+    }
+    const int k = 6 - left--;
+    char name[64];
     ID3D11Texture2D *t = nullptr;
     if (FAILED(bb->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&t)))) return;
-    WriteRaw(ctx, t, "preui-dump-final.raw");
+    snprintf(name, sizeof(name), "preui-dump-final-%d.raw", k);
+    WriteRaw(ctx, t, name);
     t->Release();
-    if (g_ui_tex) WriteRaw(ctx, g_ui_tex, "preui-dump-ui.raw");
-    if (g_tex) WriteRaw(ctx, g_tex, "preui-dump-pre.raw");
+    snprintf(name, sizeof(name), "preui-dump-ui-%d.raw", k);
+    if (g_ui_tex) WriteRaw(ctx, g_ui_tex, name);
+    snprintf(name, sizeof(name), "preui-dump-pre-%d.raw", k);
+    if (g_tex) WriteRaw(ctx, g_tex, name);
+    g_log("[preui] dump %d: capture #%llu on thread %lu, feed on thread %lu", k, (unsigned long long)g_captures,
+          (unsigned long)g_capture_tid, (unsigned long)GetCurrentThreadId());
+    if (left != 0) return;
     if (FILE *f = fopen("preui-dump.txt", "w")) { fprintf(f, "width=%u\nheight=%u\nformat=%u\n", g_desc.Width, g_desc.Height, (unsigned)g_desc.Format); fclose(f); }
-    g_log("[preui] wrote preui-dump-{final,ui,pre}.raw");
+    g_log("[preui] wrote preui-dump-{final,ui,pre}-{0..5}.raw");
 }
 
 // The pre-UI frame for this frame's feed, or null (no UI drawn, or off). Consumed: the next frame needs
