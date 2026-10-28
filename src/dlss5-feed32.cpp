@@ -2957,7 +2957,8 @@ enum
     DNL_FOVEA_FIRST = 6, DNL_FOVEA_DEBUG = 6,
     DNL_PERI_FIRST = 12, DNL_PERI_LAST = 18,
     DNL_FOV_FIRST = 19, DNL_FOVEATION = 19, DNL_SPLIT = 24, DNL_SPLIT_CALLS = 25, DNL_GLOBAL_SCALE = 26,
-    DNL_GRADE_BLUR = 27, DNL_GAZE_SOURCE = 28, DNL_ENGINE = 31, DNL_COUNT = 33
+    DNL_GRADE_BLUR = 27, DNL_RELIGHT = 28, DNL_RELIGHT_DARKEN = 29, DNL_GAZE_SOURCE = 30, DNL_ENGINE = 33,
+    DNL_COUNT = 35
 };
 
 static const NRSetting kDnl[DNL_COUNT] = {
@@ -3003,11 +3004,16 @@ static const NRSetting kDnl[DNL_COUNT] = {
     { "SplitCalls",         "Model calls",             NR_FLOAT,  2.0f,  1.0f,  2.0f, "%.0f", nullptr, 0,
       "2 = a call per pass (own settings and debug view each), 1 = one call on an atlas of both." },
     { "GlobalScale",        "Low-res frame",           NR_FLOAT, 0.25f,  0.1f,  0.5f, "%.2f of the frame", nullptr, 0, nullptr },
-    { "GradeBlur",          "Tone blur",               NR_FLOAT,  1.0f,  1.0f, 16.0f, "%.1f px", nullptr, 0,
+    { "GradeBlur",          "Tone blur",               NR_FLOAT,  1.0f,  0.0f, 16.0f, "%.1f px", nullptr, 0,
       "Softens the low-res pass's correction before it is spread over the screen, in low-res pixels (one is about "
       "7 screen pixels with our engine). Higher keeps only broad brightness and colour, so small motion (panning, "
       "idle breathing) cannot make it crawl; too high may leave soft halos where bright meets dark. No trails: "
       "it is spatial only." },
+    { "Relight",            "Relighting kept",         NR_FLOAT,  1.0f,  0.0f,  1.0f, "%.2f", nullptr, 0,
+      "How much of the model's broad brightness and colour change reaches the picture: 1 = all of it, 0 = none "
+      "(only its fine detail stays, in the crop). Lower it when the model relights the scene." },
+    { "RelightDarkenOnly",  "Relighting may only darken", NR_BOOL, 0.0f, 0.0f,  1.0f, nullptr, nullptr, 0,
+      "The broad change may only darken, and only brightness (no colour shift): roughly ambient occlusion." },
     { "GazeSource",         "Fovea centre",            NR_COMBO,  0.0f,  0.0f,  1.0f, nullptr, kDnlGazeItems, 2, nullptr },
     { "GazePort",           "Gaze UDP port",           NR_FLOAT, 47620.0f, 1024.0f, 65535.0f, "%.0f", nullptr, 0,
       "Two little-endian float32 (x, y), 0..1 from the top-left, sent to 127.0.0.1 on this port." },
@@ -6339,7 +6345,7 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
             // Per-pass debug views and the periphery's own settings only exist with two calls; the
             // split's own controls only with the split; the gaze port and smoothing only with a gaze source.
             if (!two_passes && (i == DNL_FOVEA_DEBUG || (i >= DNL_PERI_FIRST && i <= DNL_PERI_LAST))) continue;
-            if (!split && (i == DNL_SPLIT_CALLS || i == DNL_GLOBAL_SCALE || i == DNL_GRADE_BLUR)) continue;
+            if (!split && (i == DNL_SPLIT_CALLS || i == DNL_GLOBAL_SCALE || (i >= DNL_GRADE_BLUR && i <= DNL_RELIGHT_DARKEN))) continue;
             if (i > DNL_GAZE_SOURCE && i < DNL_ENGINE && g_dnl[DNL_GAZE_SOURCE] < 0.5f) continue;
             if (i >= DNL_ENGINE && (!two_passes || (i > DNL_ENGINE && g_dnl[DNL_ENGINE] < 0.5f))) continue;
 
