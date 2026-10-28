@@ -26,7 +26,9 @@ static ID3D11Texture2D          *g_tex = nullptr;   // the pre-UI frame
 static ID3D11ShaderResourceView *g_srv = nullptr;
 static D3D11_TEXTURE2D_DESC      g_desc = {};
 static uint64_t g_captures = 0;
-static DWORD    g_capture_tid = 0;         // the thread the last capture ran on (the feed's should match)
+static DWORD    g_capture_tid = 0;
+static uint64_t g_presents = 0;            // presents seen (the frame clock)
+static uint64_t g_cap_present = ~0ull;     // g_presents when the last capture was made         // the thread the last capture ran on (the feed's should match)
 static void (*g_log)(const char *, ...) = nullptr;
 
 static bool In(const uint64_t (&set)[4], uint64_t h)
@@ -99,6 +101,7 @@ static void Capture(ID3D11DeviceContext *ctx, ID3D11Resource *src)
     t->Release();
     g_captured = true;
     g_capture_tid = GetCurrentThreadId();
+    g_cap_present = g_presents;
     if (++g_captures == 1) g_log("[preui] first pre-UI capture (the UI starts after a full-screen pass into the final surface)");
 }
 
@@ -111,6 +114,9 @@ static void OnBind(reshade::api::command_list *cmd, uint32_t count, const reshad
 static void OnAnyDraw(reshade::api::command_list *cmd, bool fullscreen)
 {
     if (!g_on || g_rt == 0 || !In(g_finals, g_rt)) return;
+    // One capture per frame, at the FIRST UI draw: UI elements can be full-screen quads too (a backdrop,
+    // a fade), and re-arming on them captured part of the UI, a different part each frame.
+    if (g_cap_present == g_presents) return;
     if (fullscreen)
     {
         g_scene_rt = g_rt;     // the finished scene (again): any earlier capture is stale
@@ -149,6 +155,7 @@ static bool OnCopy(reshade::api::command_list *, reshade::api::resource src, res
 static void OnPresent(reshade::api::command_queue *, reshade::api::swapchain *sc, const reshade::api::rect *,
                       const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
+    ++g_presents;
     const uint64_t bb = sc->get_current_back_buffer().handle;
     if (!In(g_backbuffers, bb)) { Add(g_backbuffers, bb); Add(g_finals, bb); }
 }
@@ -288,7 +295,7 @@ static ID3D11Texture2D *Take(const D3D11_TEXTURE2D_DESC &want)
         g_log("[preui] last 1800 frames: %llu fed the pre-UI frame, %llu had no capture",
               (unsigned long long)fed, (unsigned long long)none), fed = none = 0;
     g_used = false;
-    if (!g_on || !g_captured || g_tex == nullptr) { if (g_on) ++none; return nullptr; }
+    if (!g_on || !g_captured || g_tex == nullptr || g_presents - g_cap_present > 1) { if (g_on) ++none; g_captured = false; return nullptr; }
     g_captured = false;
     g_scene_rt = 0;
     if (want.Width != g_desc.Width || want.Height != g_desc.Height || ViewFormat(want.Format) != ViewFormat(g_desc.Format))
