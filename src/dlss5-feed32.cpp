@@ -49,6 +49,7 @@
 #include <imgui.h>
 #include <reshade.hpp>
 #include "feed_uiprobe.h"
+#include "feed_preui.h"
 
 #include "feed_ipc.h"
 #include "feed_crash.h" // naming a C++ throw, shared with the 64-bit add-on and the host
@@ -411,6 +412,7 @@ static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 
 static int       g_work_resolution_ui = 100;
 static int       g_ui_probe = 0;          // ui_probe=N: log N frames of draws (feed_uiprobe.h)
 static int       g_ui_probe_after = 600;  // ui_probe_after: from this present on
+static int       g_preui = 0;             // preui=1: feed the frame before the UI (feed_preui.h)
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
 
@@ -620,6 +622,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
         else if (_stricmp(key, "ui_probe")       == 0) g_ui_probe       = iv < 0 ? 0 : iv > 8 ? 8 : iv;
         else if (_stricmp(key, "ui_probe_after") == 0) g_ui_probe_after = iv;
+        else if (_stricmp(key, "preui")          == 0) g_preui          = iv == 1 ? 1 : 0;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -2181,6 +2184,12 @@ static void OnPresent(reshade::api::effect_runtime *rt)
         probe_armed = true;
         uiprobe::Register(g_ui_probe, g_ui_probe_after, &Log);
     }
+    static bool preui_armed = false;
+    if (!preui_armed && g_preui)
+    {
+        preui_armed = true;
+        preui::Register(&Log);
+    }
     // The host buttons are drained HERE, not in FeedFrame. FeedFrame only runs when the
     // DLSS5_Feed technique renders, so with the effect missing or disabled, effects toggled
     // off, or mode=0, "Start the DLSS 5 host" would have done nothing at all -- and that is
@@ -3602,6 +3611,7 @@ static bool MakeBlitShaders()
     ps->Release();
     resample->Release();
     if (FAILED(hr)) { Log("[feed32] blit shader creation failed 0x%08X", hr); return false; }
+    preui::CreateShader(g.dev, compile);
 
     D3D11_SAMPLER_DESC sd = {};
     // Linear: below 100% this sampler both downsamples the colour and upscales the result.
@@ -4613,15 +4623,33 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
         ctx->Draw(3, 0);
         src = g.easu_srv;
     }
+    // preui: the plain blit becomes the UI composite (the game's pixel wherever its UI changed it).
+    bool ui = false;
+    if (!easu && !rcas && !scaled)
+    {
+        ID3D11Resource *bb = nullptr;
+        rtv->GetResource(&bb);
+        if (bb != nullptr) { ui = preui::CopyFinished(ctx, bb); bb->Release(); }
+    }
     if (rcas || !easu)
     {
         ID3D11ShaderResourceView *unbind = nullptr;
         ctx->PSSetShaderResources(0, 1, &unbind);      // easu_tex leaves the OM before it enters the PS
         ID3D11RenderTargetView *target[] = { rtv };
         ctx->OMSetRenderTargets(1, target, nullptr);
-        ctx->PSSetShader(rcas ? g.rcas_ps : g.blit_ps, nullptr, 0);
+        ctx->PSSetShader(ui ? preui::g_ui_ps : rcas ? g.rcas_ps : g.blit_ps, nullptr, 0);
         ctx->PSSetShaderResources(0, 1, &src);
+        if (ui)
+        {
+            ID3D11ShaderResourceView *more[2] = { preui::g_ui_srv, preui::g_srv };
+            ctx->PSSetShaderResources(1, 2, more);
+        }
         ctx->Draw(3, 0);
+        if (ui)
+        {
+            ID3D11ShaderResourceView *none[2] = { nullptr, nullptr };
+            ctx->PSSetShaderResources(1, 2, none);
+        }
     }
 
     ID3D11ShaderResourceView *no_srv = nullptr;
@@ -5605,7 +5633,8 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
                 HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
             }
             Breadcrumb("preparing work-resolution inputs");
-            if (!CopyOrResampleInputs(ctx, color, mv, depth,
+            ID3D11Texture2D *pre_ui = preui::Take(cd);   // the frame before the UI, when it was captured
+            if (!CopyOrResampleInputs(ctx, pre_ui != nullptr ? pre_ui : color, mv, depth,
                                       reinterpret_cast<ID3D11ShaderResourceView *>(mv_srv.handle),
                                       reinterpret_cast<ID3D11ShaderResourceView *>(d_srv.handle),
                                       cd.Width, cd.Height))
