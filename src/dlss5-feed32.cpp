@@ -412,7 +412,7 @@ static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 
 static int       g_work_resolution_ui = 100;
 static int       g_ui_probe = 0;          // ui_probe=N: log N frames of draws (feed_uiprobe.h)
 static int       g_ui_probe_after = 600;  // ui_probe_after: from this present on
-static int       g_preui = 0;             // preui=1: feed the frame before the UI (feed_preui.h)
+static int       g_preui = 0;             // preui=1/2: feed the frame before the UI (feed_preui.h)
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
 
@@ -622,7 +622,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
         else if (_stricmp(key, "ui_probe")       == 0) g_ui_probe       = iv < 0 ? 0 : iv > 8 ? 8 : iv;
         else if (_stricmp(key, "ui_probe_after") == 0) g_ui_probe_after = iv;
-        else if (_stricmp(key, "preui")          == 0) g_preui          = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "preui")          == 0) g_preui          = iv == 1 || iv == 2 ? iv : 0;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -2176,6 +2176,45 @@ static bool OnOpenOverlay(reshade::api::effect_runtime *rt, bool open, reshade::
     return false;   // never veto
 }
 
+// preui=2: the effect chain (motion estimator, DLSS5_Feed -> the neural pass and its result) on the scene
+// surface just before the game's first UI draw, in a clean device state; the game's own state is put back
+// whole afterwards, so its UI draw goes on as if nothing ran.
+static bool RenderBeforeUi(reshade::api::command_list *cmd, reshade::api::resource_view rtv)
+{
+    if (g.runtime == nullptr || rtv.handle == 0 || !g_cfg.enabled || g.disabled) return false;
+    auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
+    if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return false;
+    static ID3DDeviceContextState *blank = nullptr;
+    static bool unsupported = false;
+    if (unsupported) return false;
+    ID3D11DeviceContext1 *ctx1 = nullptr;
+    if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1))) || ctx1 == nullptr)
+    { unsupported = true; Log("[preui] native: ID3D11DeviceContext1 unavailable; nothing runs before the UI"); return false; }
+    if (blank == nullptr)
+    {
+        ID3D11Device *dev = nullptr;
+        ctx->GetDevice(&dev);
+        ID3D11Device1 *dev1 = nullptr;
+        const D3D_FEATURE_LEVEL fl = dev != nullptr ? dev->GetFeatureLevel() : D3D_FEATURE_LEVEL_11_0;
+        if (dev == nullptr || FAILED(dev->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void **>(&dev1))) ||
+            FAILED(dev1->CreateDeviceContextState(0, &fl, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device1), nullptr, &blank)))
+        {
+            unsupported = true;
+            Log("[preui] native: could not create a device context state; nothing runs before the UI");
+        }
+        SafeRelease(dev1);
+        SafeRelease(dev);
+        if (unsupported) { ctx1->Release(); return false; }
+    }
+    ID3DDeviceContextState *game = nullptr;
+    ctx1->SwapDeviceContextState(blank, &game);
+    g.runtime->render_effects(cmd, rtv, rtv);
+    ctx1->SwapDeviceContextState(game, nullptr);
+    SafeRelease(game);
+    ctx1->Release();
+    return true;
+}
+
 static void OnPresent(reshade::api::effect_runtime *rt)
 {
     static bool probe_armed = false;
@@ -2188,7 +2227,7 @@ static void OnPresent(reshade::api::effect_runtime *rt)
     if (!preui_armed && g_preui)
     {
         preui_armed = true;
-        preui::Register(&Log);
+        preui::Register(&Log, g_preui, &RenderBeforeUi);
     }
     // The host buttons are drained HERE, not in FeedFrame. FeedFrame only runs when the
     // DLSS5_Feed technique renders, so with the effect missing or disabled, effects toggled
@@ -5553,6 +5592,9 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
     ID3D11Texture2D *depth = AsTexture2D(depth_res, &dd);
     if (color == nullptr || mv == nullptr || depth == nullptr)
     { SafeRelease(color); SafeRelease(mv); SafeRelease(depth); return; }
+    // preui=2 feeds the game's own scene surface, which wrappers make TYPELESS; the shared set is built and
+    // viewed in its UNORM format, the same as the backbuffer's, so frames with and without UI share it.
+    cd.Format = preui::ViewFormat(cd.Format);
 
     bool ok = true;
     if (cd.Width != md.Width || cd.Height != md.Height || cd.Width != dd.Width || cd.Height != dd.Height ||

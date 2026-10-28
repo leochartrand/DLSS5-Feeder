@@ -9,6 +9,16 @@
 // non-full-screen draw into it after a full-screen one, the surface is copied aside: that copy is the
 // pre-UI frame. A frame with no such draw has no UI, and the backbuffer is fed as before.
 // ui_probe=N (feed_uiprobe.h) logs the draw sequence this relies on.
+//
+// preui=2 (native): at that same point the whole effect chain runs on the finished scene surface
+// (effect_runtime::render_effects: the motion estimator, then DLSS5_Feed, which feeds the frame and draws
+// the result into it), and the game then draws its own UI over the result with its own blending. Nothing
+// is copied and nothing about the UI is guessed. ReShade skips its usual effect pass at Present on such a
+// frame; a frame with no UI renders at Present as before. The device state around it is saved and restored
+// whole (SwapDeviceContextState).
+// preui=1 (composite): the scene surface is copied there, fed instead of the backbuffer at Present, and the
+// UI is put back over the answer by comparing the finished frame with that copy -- an estimate of the UI that
+// fails on light translucent UI. Kept for comparison.
 #pragma once
 
 #include <d3d11.h>
@@ -17,6 +27,11 @@
 namespace preui {
 
 static bool     g_on = false;
+static int      g_mode = 1;                // 1 composite, 2 native (see above)
+static reshade::api::resource_view g_rtv = {};   // the render target view bound now
+// preui=2: runs the effect chain on `rtv` (set by the add-on); false when it could not.
+static bool (*g_render_here)(reshade::api::command_list *, reshade::api::resource_view) = nullptr;
+static uint64_t g_native = 0, g_native_failed = 0;
 static uint64_t g_backbuffers[4] = {};     // swapchain backbuffer handles seen at present
 static uint64_t g_finals[4] = {};          // surfaces copied onto a backbuffer: where the frame is finished
 static uint64_t g_rt = 0;                  // the render target bound now
@@ -109,6 +124,7 @@ static void OnBind(reshade::api::command_list *cmd, uint32_t count, const reshad
                    reshade::api::resource_view)
 {
     g_rt = count > 0 && rtvs[0].handle != 0 ? cmd->get_device()->get_resource_from_view(rtvs[0]).handle : 0;
+    g_rtv = count > 0 ? rtvs[0] : reshade::api::resource_view{};
 }
 
 static void OnAnyDraw(reshade::api::command_list *cmd, bool fullscreen)
@@ -125,6 +141,18 @@ static void OnAnyDraw(reshade::api::command_list *cmd, bool fullscreen)
     }
     if (g_scene_rt == g_rt && !g_captured)
     {
+        if (g_mode == 2)
+        {
+            g_cap_present = g_presents;   // once this frame, whether it worked or not
+            // The effects bind their own targets; the game's are restored with its state, so is our view of them.
+            const uint64_t rt = g_rt;
+            const reshade::api::resource_view rtv = g_rtv;
+            if (g_render_here != nullptr && g_render_here(cmd, rtv)) ++g_native;
+            else ++g_native_failed;
+            g_rt = rt;
+            g_rtv = rtv;
+            return;
+        }
         auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
         if (ctx != nullptr) Capture(ctx, reinterpret_cast<ID3D11Resource *>(g_rt));
     }
@@ -152,10 +180,36 @@ static bool OnCopy(reshade::api::command_list *, reshade::api::resource src, res
     return false;
 }
 
-static void OnPresent(reshade::api::command_queue *, reshade::api::swapchain *sc, const reshade::api::rect *,
+static void WriteRaw(ID3D11DeviceContext *ctx, ID3D11Texture2D *src, const char *path);
+
+static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *sc, const reshade::api::rect *,
                       const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
+    // preui=2: preui-dump.request beside the exe writes the next 6 finished frames (UI included) as
+    // preui-dump-native-<k>.raw (RGBA8 rows) -- the picture as shown.
+    static int dump_left = 0;
+    if (g_mode == 2 && (dump_left > 0 || (g_presents % 30 == 0 && GetFileAttributesA("preui-dump.request") != INVALID_FILE_ATTRIBUTES)))
+    {
+        if (dump_left == 0) { DeleteFileA("preui-dump.request"); dump_left = 6; }
+        auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(queue->get_immediate_command_list()->get_native());
+        ID3D11Texture2D *t = nullptr;
+        auto *bb = reinterpret_cast<ID3D11Resource *>(sc->get_current_back_buffer().handle);
+        if (ctx != nullptr && bb != nullptr && SUCCEEDED(bb->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&t))))
+        {
+            char name[64];
+            snprintf(name, sizeof(name), "preui-dump-native-%d.raw", 6 - dump_left);
+            WriteRaw(ctx, t, name);
+            t->Release();
+        }
+        if (--dump_left == 0) g_log("[preui] wrote preui-dump-native-{0..5}.raw");
+    }
     ++g_presents;
+    if (g_mode == 2 && g_presents % 1800 == 0)
+    {
+        g_log("[preui] last 1800 frames: %llu fed before the UI, %llu could not be", (unsigned long long)g_native,
+              (unsigned long long)g_native_failed);
+        g_native = g_native_failed = 0;
+    }
     const uint64_t bb = sc->get_current_back_buffer().handle;
     if (!In(g_backbuffers, bb)) { Add(g_backbuffers, bb); Add(g_finals, bb); }
 }
@@ -326,17 +380,21 @@ static ID3D11Texture2D *Take(const D3D11_TEXTURE2D_DESC &want)
     return g_tex;
 }
 
-static void Register(void (*log)(const char *, ...))
+static void Register(void (*log)(const char *, ...), int mode,
+                     bool (*render_here)(reshade::api::command_list *, reshade::api::resource_view))
 {
     if (g_on) return;
     g_on = true;
     g_log = log;
+    g_mode = mode == 2 && render_here != nullptr ? 2 : 1;
+    g_render_here = render_here;
     reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBind);
     reshade::register_event<reshade::addon_event::draw>(OnDraw);
     reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
     reshade::register_event<reshade::addon_event::copy_resource>(OnCopy);
     reshade::register_event<reshade::addon_event::present>(OnPresent);
-    log("[preui] on: the neural pass gets the frame before the UI; UI pixels keep the game's own colour");
+    log(g_mode == 2 ? "[preui] on (native): the effects and the neural pass run before the game's UI, which is drawn over the result"
+                    : "[preui] on (composite): the neural pass gets the frame before the UI; UI pixels keep the game's own colour");
 }
 
 }  // namespace preui
