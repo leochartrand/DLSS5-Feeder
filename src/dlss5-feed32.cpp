@@ -2957,7 +2957,7 @@ enum
     DNL_FOVEA_FIRST = 8, DNL_FOVEA_DEBUG = 8,
     DNL_PERI_FIRST = 20, DNL_PERI_LAST = 28,
     DNL_FOV_FIRST = 29, DNL_FOVEATION = 29, DNL_SPLIT = 34, DNL_SPLIT_CALLS = 35, DNL_GLOBAL_SCALE = 36,
-    DNL_GRADE_BLUR = 37, DNL_CROP_SNAP = 40, DNL_GAZE_SOURCE = 41, DNL_ENGINE = 44, DNL_COUNT = 46
+    DNL_GRADE_BLUR = 37, DNL_CROP_SNAP = 40, DNL_GAZE_SOURCE = 41, DNL_ENGINE = 45, DNL_COUNT = 47
 };
 
 static const NRSetting kDnl[DNL_COUNT] = {
@@ -3045,6 +3045,8 @@ static const NRSetting kDnl[DNL_COUNT] = {
     { "GazePort",           "Gaze UDP port",           NR_FLOAT, 47620.0f, 1024.0f, 65535.0f, "%.0f", nullptr, 0,
       "Two little-endian float32 (x, y), 0..1 from the top-left, sent to 127.0.0.1 on this port." },
     { "GazeSmoothMs",       "Gaze smoothing",          NR_FLOAT, 30.0f,  0.0f, 200.0f, "%.0f ms", nullptr, 0, nullptr },
+    { "GazeJumpReset",      "Gaze jump reset",         NR_FLOAT, 0.20f, 0.02f,  2.0f, "%.2f of the frame", nullptr, 0,
+      "A gaze move larger than this (a saccade) lands at once and starts the model's history over." },
 
     { "NREngine",           "Our engine instead of NGX", NR_BOOL, 0.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
       "Runs both passes on our own precompiled Ampere engine (host64\\nr-engine) instead of NVIDIA's NGX. "
