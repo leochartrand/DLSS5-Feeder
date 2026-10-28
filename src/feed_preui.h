@@ -162,8 +162,10 @@ static void OnPresent(reshade::api::command_queue *, reshade::api::swapchain *sc
 
 // The UI composite for the blit home: a copy of the backbuffer as the game finished it (UI included), made
 // just before the result is drawn over it, and the pixel shader. Where the UI changed a pixel a little (a
-// translucent overlay: vignettes, grunge borders, fades) its change is added onto the model's answer;
-// where it changed it a lot (opaque text and icons) the game's pixel is kept as is.
+// translucent overlay: grunge borders, fades) its change is added onto the model's answer; where it
+// darkened every channel by the same ratio (a vignette: translucent black, however strong) the answer is
+// scaled by that ratio, so the darkening follows the answer instead of being subtracted from it; where it
+// changed it a lot otherwise (opaque text and icons) the game's pixel is kept as is.
 static ID3D11Texture2D          *g_ui_tex = nullptr;
 static ID3D11ShaderResourceView *g_ui_srv = nullptr;
 static ID3D11PixelShader        *g_ui_ps  = nullptr;
@@ -179,10 +181,17 @@ static const char kUiSrc[] =
     "  float3 nr = nr_tex.Sample(smp, i.uv).rgb;\n"
     "  int3 p = int3(i.pos.xy, 0);\n"
     "  float3 ui = ui_tex.Load(p).rgb;\n"
-    "  float3 delta = ui - pre_tex.Load(p).rgb;\n"
+    "  float3 pre = pre_tex.Load(p).rgb;\n"
+    "  float3 delta = ui - pre;\n"
     "  float d = max(abs(delta.r), max(abs(delta.g), abs(delta.b)));\n"
-    "  float opaque = saturate((d - 0.2) * 5.0);\n"
-    "  return float4(lerp(saturate(nr + delta), ui, opaque), 1.0); }\n";
+    "  float3 r = ui / max(pre, 1e-3);\n"
+    "  float rmax = max(r.r, max(r.g, r.b)), rmin = min(r.r, min(r.g, r.b));\n"
+    "  float lit = max(pre.r, max(pre.g, pre.b));\n"
+    "  float dark = (1.0 - smoothstep(0.03, 0.1, rmax - rmin)) * (1.0 - smoothstep(1.0, 1.05, rmax)) *\n"
+    "               smoothstep(0.02, 0.06, lit);\n"
+    "  float3 under = lerp(saturate(nr + delta), nr * saturate((r.r + r.g + r.b) / 3.0), dark);\n"
+    "  float opaque = saturate((d - 0.2) * 5.0) * (1.0 - dark);\n"
+    "  return float4(lerp(under, ui, opaque), 1.0); }\n";
 
 // The composite's shader, from the add-on's D3DCompile (null: no composite, the blit stays plain).
 template <typename Compile>
